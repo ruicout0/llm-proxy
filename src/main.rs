@@ -590,16 +590,42 @@ async fn handle_request(
     match token_cache.client.request(req).await {
         Ok(resp) => {
             let status = resp.status();
-            let body = resp.into_body();
             
             if status == StatusCode::UNAUTHORIZED {
-                warn!("Got 401 from LLM - forcing token refresh on next request");
+                warn!("Got 401 from LLM - refreshing token and retrying once");
                 *token_cache.bearer_token.write().await = None;
+                
+                // Rebuild request with fresh token and retry
+                let fresh_bearer = token_cache.get_valid_bearer().await?;
+                let x_api_key = token_cache.get_x_api_key().await?;
+                
+                let retry_req = Request::builder()
+                    .method(Method::GET)
+                    .uri(new_uri.clone())
+                    .header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", fresh_bearer))?)
+                    .header("x-apikey".parse::<hyper::header::HeaderName>()?, HeaderValue::from_str(&x_api_key)?)
+                    .header(CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"))
+                    .header(hyper::header::HOST, HeaderValue::from_str(host_only)?)
+                    .body(Body::empty())?;
+                
+                info!("Retrying request with fresh token");
+                match token_cache.client.request(retry_req).await {
+                    Ok(retry_resp) => {
+                        if retry_resp.status() == StatusCode::UNAUTHORIZED {
+                            warn!("Still got 401 after token refresh");
+                        }
+                        Ok(retry_resp)
+                    }
+                    Err(e) => {
+                        error!("Retry request failed: {}", e);
+                        Ok(Response::builder()
+                            .status(StatusCode::BAD_GATEWAY)
+                            .body(Body::from("Upstream error after token refresh"))?)
+                    }
+                }
+            } else {
+                Ok(resp)
             }
-            
-            Ok(Response::builder()
-                .status(status)
-                .body(body)?)
         }
         Err(e) => {
             error!("Upstream request failed: {}", e);
