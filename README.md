@@ -180,7 +180,7 @@ localhost:{port} (llm-proxy)
     ├─ Adds: Cache-Control: no-cache, no-store, must-revalidate
     ├─ Sets: Host header (hostname only, path prefix stripped)
     ├─ Auto-refreshes bearer token 60s before expiry
-    ├─ On 401: invalidates cache → forces refresh
+    ├─ On 401: forces token refresh and retries once
     ▼ HTTPS (with auth headers)
 LLM Provider API
 ```
