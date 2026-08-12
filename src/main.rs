@@ -30,6 +30,8 @@ use hyper::{
 use hyper::service::{make_service_fn, service_fn};
 use hyper::server::Server;
 use hyper::client::HttpConnector;
+use rustls_pemfile;
+use hyper_rustls::HttpsConnector;
 use hyper::Client;
 use keyring::Entry;
 use plist::{Dictionary, Value as PlistValue};
@@ -41,6 +43,22 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use hyper::body::to_bytes;
+
+// No-op TLS certificate verifier for internal/self-signed certs
+struct NoopVerifier;
+impl rustls::client::ServerCertVerifier for NoopVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::Certificate,
+        _intermediates: &[rustls::Certificate],
+        _server_name: &rustls::ServerName,
+        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _ocsp_response: &[u8],
+        _now: std::time::SystemTime,
+    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::ServerCertVerified::assertion())
+    }
+}
 
 // ============================================================================
 // Config File
@@ -62,8 +80,17 @@ struct ConfigFile {
     client_id: Option<String>,
     /// OAuth client secret
     client_secret: Option<String>,
-    /// Static Bearer token (alternative to OAuth)
+    /// OAuth scope (e.g., "machine2machine")
+    #[serde(default)]
+    oauth_scope: Option<String>,
+    /// Static bearer token (alternative to OAuth)
     bearer_token: Option<String>,
+    /// Optional CA certificate path (PEM format) for custom TLS verification
+    #[serde(default)]
+    ca_cert_path: Option<String>,
+    /// Skip TLS certificate verification for upstream LLM host
+    #[serde(default)]
+    insecure_skip_tls_verify: bool,
 }
 
 fn default_port() -> u16 { 3128 }
@@ -169,6 +196,9 @@ struct Config {
     token_endpoint: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
+    oauth_scope: Option<String>,
+    ca_cert_path: Option<String>,
+    insecure_skip_tls_verify: bool,
 }
 
 impl Config {
@@ -211,6 +241,9 @@ impl Config {
                     client_id: args.client_id.clone(),
                     client_secret: args.client_secret.clone(),
                     listen_port: args.port,
+                    ca_cert_path: None,
+                    oauth_scope: None,
+                    insecure_skip_tls_verify: false,
                 });
                 file_config.as_ref().unwrap().validate()?;
             }
@@ -228,11 +261,12 @@ impl Config {
             token_endpoint: fc.token_endpoint,
             client_id: fc.client_id,
             client_secret: fc.client_secret,
+            oauth_scope: fc.oauth_scope,
+            ca_cert_path: fc.ca_cert_path,
+            insecure_skip_tls_verify: fc.insecure_skip_tls_verify,
         })
     }
 }
-
-// ============================================================================
 // Interactive Setup
 // ============================================================================
 
@@ -280,12 +314,15 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
         .interact()?;
     
     let mut config = ConfigFile {
+        ca_cert_path: None,
         llm_host,
         api_key,
         listen_port,
         token_endpoint: None,
         client_id: None,
         client_secret: None,
+        oauth_scope: None,
+        insecure_skip_tls_verify: false,
         bearer_token: None,
     };
     
@@ -302,10 +339,17 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
         let client_secret: String = Input::new()
             .with_prompt("OAuth Client Secret")
             .interact_text()?;
-        
-        config.token_endpoint = Some(token_endpoint);
-        config.client_id = Some(client_id);
-        config.client_secret = Some(client_secret);
+
+                let scope: String = Input::new()
+                    .with_prompt("OAuth scope (optional, e.g., 'machine2machine' - leave empty to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+                let scope = if scope.is_empty() { None } else { Some(scope) };
+
+                config.token_endpoint = Some(token_endpoint);
+                config.client_id = Some(client_id);
+                config.client_secret = Some(client_secret);
+                config.oauth_scope = scope;
     } else {
         // Static bearer token
         let bearer_token: String = Input::new()
@@ -342,13 +386,56 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
 struct TokenCache {
     bearer_token: RwLock<Option<(String, Instant)>>,
     config: Arc<Config>,
-    client: Client<HttpConnector>,
+    client: Client<HttpsConnector<HttpConnector>>,
 }
 
 impl TokenCache {
     fn new(config: Arc<Config>) -> Self {
-        let connector = HttpConnector::new();
-        let client = Client::builder().build(connector);
+        let client_config = if config.insecure_skip_tls_verify {
+            info!("WARNING: TLS certificate verification disabled for upstream connections");
+            rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_custom_certificate_verifier(Arc::new(NoopVerifier))
+                .with_no_client_auth()
+        } else {
+            let mut root_store = rustls::RootCertStore::empty();
+            root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
+                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
+                    ta.subject,
+                    ta.spki,
+                    ta.name_constraints,
+                )
+            }));
+            
+            // Load custom CA certificate if provided
+            if let Some(cert_path) = &config.ca_cert_path {
+                if let Ok(cert_data) = std::fs::read(cert_path) {
+                    if let Ok(certs) = rustls_pemfile::certs(&mut &cert_data[..]) {
+                        for cert in certs {
+                            root_store.add(&rustls::Certificate(cert)).ok();
+                        }
+                        info!("Loaded custom CA certificate from: {}", cert_path);
+                    } else {
+                        warn!("Failed to parse CA certificate from: {}", cert_path);
+                    }
+                } else {
+                    warn!("Failed to read CA certificate from: {}", cert_path);
+                }
+            }
+            
+            rustls::ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+        
+        let https = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config(client_config)
+            .https_or_http()
+            .enable_http1()
+            .build();
+        
+        let client = Client::builder().build(https);
         Self {
             bearer_token: RwLock::new(None),
             config,
@@ -389,11 +476,20 @@ impl TokenCache {
         let client_secret = self.config.client_secret.as_ref()
             .context("client_secret required for token refresh")?;
 
-        let form = format!(
-            "grant_type=client_credentials&client_id={}&client_secret={}",
-            urlencoding::encode(client_id),
-            urlencoding::encode(client_secret)
-        );
+        let form = if let Some(ref scope) = self.config.oauth_scope {
+            format!(
+                "grant_type=client_credentials&client_id={}&client_secret={}&scope={}",
+                urlencoding::encode(client_id),
+                urlencoding::encode(client_secret),
+                urlencoding::encode(scope)
+            )
+        } else {
+            format!(
+                "grant_type=client_credentials&client_id={}&client_secret={}",
+                urlencoding::encode(client_id),
+                urlencoding::encode(client_secret)
+            )
+        };
 
         let req = Request::builder()
             .method(Method::POST)
@@ -419,42 +515,52 @@ impl TokenCache {
     }
 }
 
-// ============================================================================
-// Request Handler
-// ============================================================================
-
 async fn handle_request(
     req: Request<Body>,
     token_cache: Arc<TokenCache>,
     config: Arc<Config>,
 ) -> Result<Response<Body>> {
-    let host = req.uri().host().unwrap_or("").to_string();
-    let is_llm = host == config.llm_host;
-
+    // Get path and query before consuming req
+    let path_and_query = req.uri().path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/")
+        .to_string();
+    
+    // Always inject auth headers and forward to configured LLM host
+    let bearer = token_cache.get_valid_bearer().await?;
+    let x_api_key = token_cache.get_x_api_key().await?;
+    
     let (mut parts, body) = req.into_parts();
     
-    if is_llm {
-        let bearer = token_cache.get_valid_bearer().await?;
-        let x_api_key = token_cache.get_x_api_key().await?;
-        
-        parts.headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", bearer))?
-        );
-        
-        parts.headers.insert(
-            "x-apikey".parse::<hyper::header::HeaderName>()?,
-            HeaderValue::from_str(&x_api_key)?
-        );
-        
-        parts.headers.insert(
-            CACHE_CONTROL,
-            HeaderValue::from_static("no-cache, no-store, must-revalidate")
-        );
-        
-        debug!("Injected auth headers for LLM request to {}", host);
-    }
-
+    // Rewrite URI to target the LLM host
+    let new_uri = format!("https://{}{}", config.llm_host, path_and_query);
+    parts.uri = new_uri.parse()?;
+    
+    // Inject auth headers
+    parts.headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", bearer))?
+    );
+    
+    parts.headers.insert(
+        "x-apikey".parse::<hyper::header::HeaderName>()?,
+        HeaderValue::from_str(&x_api_key)?
+    );
+    
+    parts.headers.insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate")
+    );
+    
+    // Ensure Host header matches target (hostname only, no path)
+    let host_only = config.llm_host.split('/').next().unwrap_or(&config.llm_host);
+    parts.headers.insert(
+        hyper::header::HOST,
+        HeaderValue::from_str(host_only)?
+    );
+    
+    debug!("Forwarding to {} with auth headers", config.llm_host);
+    
     let req = Request::from_parts(parts, body);
     
     match token_cache.client.request(req).await {
@@ -462,7 +568,7 @@ async fn handle_request(
             let status = resp.status();
             let body = resp.into_body();
             
-            if is_llm && status == StatusCode::UNAUTHORIZED {
+            if status == StatusCode::UNAUTHORIZED {
                 warn!("Got 401 from LLM - forcing token refresh on next request");
                 *token_cache.bearer_token.write().await = None;
             }
@@ -479,11 +585,6 @@ async fn handle_request(
         }
     }
 }
-
-// ============================================================================
-// Service Management (macOS launchd)
-// ============================================================================
-
 const SERVICE_LABEL: &str = "com.user.llm-proxy";
 const KEYCHAIN_SERVICE: &str = "llm-proxy";
 
@@ -535,6 +636,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
     }
     
     let config_file_content = ConfigFile {
+        ca_cert_path: config.ca_cert_path.clone(),
         llm_host: config.llm_host.clone(),
         listen_port: config.listen_port,
         api_key: config.x_api_key.clone(),
@@ -542,6 +644,8 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         token_endpoint: config.token_endpoint.clone(),
         client_id: config.client_id.clone(),
         client_secret: config.client_secret.clone(),
+        oauth_scope: config.oauth_scope.clone(),
+        insecure_skip_tls_verify: config.insecure_skip_tls_verify,
     };
     let toml_str = toml::to_string_pretty(&config_file_content)?;
     std::fs::write(&cfg_path, toml_str)?;

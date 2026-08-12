@@ -1,16 +1,13 @@
 # llm-proxy
 
-Lightweight Rust proxy for gh copilot that injects authentication headers (`Authorization: Bearer` + `x-apikey`) and optionally auto-refreshes Bearer tokens via OAuth client_credentials flow (M2M). **No upstream proxy required** - connects directly to the LLM provider.
+Lightweight Rust proxy that injects authentication headers (`Authorization: Bearer` + `x-apikey`) and auto-refreshes bearer tokens via OAuth client_credentials grant (M2M). **No upstream proxy required** — connects directly to the LLM provider.
 
 ## Quick Start
 
-### Build & Install Binary
+### Build
 ```bash
 cargo build --release
-mkdir -p ~/.local/bin
 cp target/release/llm-proxy ~/.local/bin/
-# Ensure ~/.local/bin is in your PATH (add to .zshrc/.bashrc)
-export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ### Configuration File
@@ -24,39 +21,43 @@ api_key = "your-x-api-key"
 # Optional (default: 3128)
 listen_port = 3128
 
+# llm_host can include a path prefix for all upstream requests:
+# llm_host = "api.example.com/llmapi"
+
 # Option 1: M2M OAuth auto-refresh (recommended)
 m2m_oauth_url = "https://auth.example.com/oauth/token"
 client_id = "your-client-id"
 client_secret = "your-client-secret"
+oauth_scope = "machine2machine"        # optional OAuth scope
 
-# Option 2: Static Bearer token (alternative to OAuth)
+# Option 2: Static bearer token (alternative to OAuth)
 # bearer_token = "your-static-bearer-token"
+
+# Optional: skip TLS certificate verification for upstream (internal CAs)
+# insecure_skip_tls_verify = true
+
+# Optional: custom CA certificate for upstream TLS
+# ca_cert_path = "/path/to/ca-cert.pem"
 ```
 
 ### Run (foreground)
 ```bash
-llm-proxy run
+llm-proxy run   # reads ~/.config/llm-proxy/config.toml
 ```
 
-### Configure gh copilot
+### Test
 ```bash
-# Point gh copilot to this proxy (add to .zshrc/.bashrc)
-export HTTP_PROXY=http://localhost:3128
-export HTTPS_PROXY=http://localhost:3128
-gh copilot chat
+# No auth needed — the proxy handles Bearer + x-apikey injection
+curl http://localhost:3128/v1/models
+curl -X POST http://localhost:3128/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 ## Service Management (macOS launchd)
 
 ### Install as service
 
-First, copy the binary to a permanent location:
-```bash
-mkdir -p ~/.local/bin
-cp target/release/llm-proxy ~/.local/bin/
-```
-
-Then install the launchd service (creates config file + keychain entries):
 ```bash
 # M2M OAuth auto-refresh (recommended)
 llm-proxy install \
@@ -86,15 +87,19 @@ llm-proxy uninstall # Remove service (also removes config & keychain entries)
 ## Configuration
 
 ### Config File (`~/.config/llm-proxy/config.toml`)
+
 | Field | Required | Description |
 |-------|----------|-------------|
-| `llm_host` | Yes | Target LLM provider hostname |
+| `llm_host` | Yes | Target LLM provider hostname (can include path prefix, e.g. `api.example.com/llmapi`) |
 | `api_key` | Yes | Value for `x-apikey` header |
 | `listen_port` | No | Listen port (default: 3128) |
 | `m2m_oauth_url` | No* | M2M OAuth token endpoint URL |
 | `client_id` | No* | OAuth client ID |
 | `client_secret` | No* | OAuth client secret |
-| `bearer_token` | No* | Static Bearer token (alternative to OAuth) |
+| `oauth_scope` | No | OAuth scope parameter (e.g. `machine2machine`) |
+| `bearer_token` | No* | Static bearer token (alternative to OAuth) |
+| `insecure_skip_tls_verify` | No | Skip upstream TLS certificate verification (for internal CAs) |
+| `ca_cert_path` | No | Path to custom CA certificate PEM file for upstream TLS |
 
 *Either `bearer_token` OR all three of `m2m_oauth_url`, `client_id`, `client_secret` must be provided.
 
@@ -118,7 +123,7 @@ Commands:
 Install Options:
   -h, --host <HOST>              Target LLM provider hostname
   -x, --api-key <KEY>            X-API-Key header value
-  -b, --bearer-token <TOKEN>     Static Bearer token (alternative to OAuth)
+  -b, --bearer-token <TOKEN>     Static bearer token (alternative to OAuth)
   -t, --m2m-oauth-url <URL>      M2M OAuth token endpoint URL
   -i, --client-id <ID>           OAuth client ID
   -s, --client-secret <SECRET>   OAuth client secret
@@ -136,35 +141,21 @@ When installing as a service with `--use-keychain` (default), secrets are stored
 
 This keeps secrets out of plist files and process listings. The config file only contains non-secret values.
 
-### Manual Keychain Operations
-```bash
-# Store manually
-security add-generic-password -s "llm-proxy" -a "x-api-key" -w "YOUR_KEY"
-security add-generic-password -s "llm-proxy" -a "client-secret" -w "YOUR_SECRET"
-
-# Retrieve
-security find-generic-password -s "llm-proxy" -a "x-api-key" -w
-
-# Delete
-security delete-generic-password -s "llm-proxy" -a "x-api-key"
-```
-
 ## Architecture
 
 ```
-gh copilot
+Client (curl, IDE, SDK)
     │
-    ▼ HTTP/HTTPS
-localhost:3128 (llm-proxy)
+    ▼ HTTP (no auth required)
+localhost:{port} (llm-proxy)
+    ├─ Acquires OAuth bearer token (client_credentials grant)
     ├─ Injects: Authorization: Bearer <token>
     ├─ Injects: x-apikey: <key>
     ├─ Adds: Cache-Control: no-cache, no-store, must-revalidate
-    ├─ Auto-refreshes Bearer via M2M OAuth (60s before expiry)
+    ├─ Sets: Host header (hostname only, path prefix stripped)
+    ├─ Auto-refreshes bearer token 60s before expiry
     ├─ On 401: invalidates cache → forces refresh
-    ▼
-Direct connection to LLM Provider (no upstream proxy)
-    ├─ OAuth token endpoint (for M2M refresh)
-    ▼
+    ▼ HTTPS (with auth headers)
 LLM Provider API
 ```
 
@@ -175,12 +166,14 @@ LLM Provider API
 RUST_LOG=debug cargo run -- run
 
 # Test with curl
-curl -x http://localhost:3128 https://api.your-llm-provider.com/v1/models \
-  -H "Authorization: Bearer test"  # Will be replaced by proxy
+curl http://localhost:3128/v1/models
+curl -X POST http://localhost:3128/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 ## Requirements
 
 - Rust 1.70+
-- macOS (for launchd service) or Linux (systemd - TODO)
+- macOS (for launchd service) or Linux (systemd — TODO)
 - Direct network access to LLM provider and OAuth endpoint
