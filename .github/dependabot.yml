@@ -1,0 +1,51 @@
+# Dependabot configuration for llm-proxy
+# Creates PRs for dependency updates
+
+version: 2
+updates:
+  # Cargo dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "cargo"
+    commit-message:
+      prefix: "chore(deps): "
+      include: "scope"
+    groups:
+      rust-dev-tools:
+        patterns:
+          - "clap*"
+          - "tracing*"
+          - "anyhow*"
+          - "serde*"
+          - "urlencoding*"
+        update-types:
+          - "minor"
+          - "patch"
+      security:
+        patterns:
+          - "*"
+        update-types:
+          - "security"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Berlin"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "chore(ci): "
+      include: "scope"
