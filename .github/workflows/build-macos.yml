@@ -56,6 +56,7 @@ jobs:
 
       - name: Create universal binary
         run: |
+          mkdir -p target/universal/release
           lipo -create \
             -output target/universal/release/llm-proxy \
             target/x86_64-apple-darwin/release/llm-proxy \
