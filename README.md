@@ -133,14 +133,39 @@ Install Options:
 
 ## Keychain Integration
 
-When installing as a service with `--use-keychain` (default), secrets are stored in macOS Keychain:
+Secrets can be stored in macOS Keychain instead of plaintext config files. The proxy reads from keychain at runtime, falling back to config file values if keychain entries are missing.
 
-- **Service name**: `llm-proxy`
-- **Accounts**: `x-api-key`, `bearer-token`, `client-secret` (separate entries)
-- **Retrieved at runtime** — the proxy reads from keychain first, falling back to config file values
-- Secrets are **not written** to the config file when keychain is enabled
+### Keychain entries
 
-This keeps secrets out of config files, plists, and process listings.
+| Account           | Config field    | Description              |
+|-------------------|-----------------|--------------------------|
+| `x-api-key`       | `api_key`       | X-API-Key header value   |
+| `bearer-token`    | `bearer_token`  | Static bearer token      |
+| `client-secret`   | `client_secret` | OAuth client secret      |
+
+All entries share the **service name** `llm-proxy`.
+
+### Automatic setup (install)
+
+`llm-proxy install --use-keychain` (default) stores secrets in keychain and strips them from the written config file.
+
+### Manual setup
+
+If you already have a config file with secrets, or want to pre-populate keychain before running:
+
+```bash
+security add-generic-password -s "llm-proxy" -a "x-api-key" -w "your-api-key"
+security add-generic-password -s "llm-proxy" -a "bearer-token" -w "your-bearer-token"
+security add-generic-password -s "llm-proxy" -a "client-secret" -w "your-client-secret"
+```
+
+To verify entries were created:
+
+```bash
+security find-generic-password -s "llm-proxy"
+```
+
+The proxy resolves secrets at startup in this order: **keychain → config file → error**. Entries in keychain take precedence but are optional — you can mix keychain and config file secrets as needed.
 
 ## Architecture
 
