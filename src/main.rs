@@ -100,13 +100,10 @@ impl ConfigFile {
         if self.llm_host.is_empty() {
             anyhow::bail!("llm_host is required in config file");
         }
-        if self.api_key.is_empty() {
-            anyhow::bail!("api_key is required in config file");
-        }
-        let has_static = self.bearer_token.is_some();
-        let has_oauth = self.token_endpoint.is_some() && self.client_id.is_some() && self.client_secret.is_some();
-        if !has_static && !has_oauth {
-            anyhow::bail!("Either bearer_token OR (m2m_oauth_url + client_id + client_secret) must be provided");
+        // api_key can be empty in file if stored in keychain
+        let has_oauth = self.token_endpoint.is_some() && self.client_id.is_some();
+        if self.bearer_token.is_none() && !has_oauth {
+            anyhow::bail!("Either bearer_token OR (m2m_oauth_url + client_id) must be provided. client_secret and api_key may be stored in keychain.");
         }
         Ok(())
     }
@@ -253,14 +250,41 @@ impl Config {
 
         let fc = file_config.unwrap();
         
+        // Try keychain for secrets first, fall back to config file values
+        let x_api_key = Entry::new(KEYCHAIN_SERVICE, "x-api-key")
+            .ok()
+            .and_then(|e| e.get_password().ok())
+            .unwrap_or(fc.api_key);
+        
+        let bearer_token = fc.bearer_token.or_else(|| {
+            Entry::new(KEYCHAIN_SERVICE, "bearer-token")
+                .ok()
+                .and_then(|e| e.get_password().ok())
+        });
+        
+        let client_secret = fc.client_secret.or_else(|| {
+            Entry::new(KEYCHAIN_SERVICE, "client-secret")
+                .ok()
+                .and_then(|e| e.get_password().ok())
+        });
+        
+        // Validate that we have required secrets after keychain resolution
+        if x_api_key.is_empty() {
+            anyhow::bail!("api_key is required (set in config file or keychain)");
+        }
+        let has_oauth = fc.token_endpoint.is_some() && fc.client_id.is_some() && client_secret.is_some();
+        if bearer_token.is_none() && !has_oauth {
+            anyhow::bail!("Either bearer_token OR (m2m_oauth_url + client_id + client_secret) must be configured");
+        }
+        
         Ok(Self {
             listen_port: fc.listen_port,
             llm_host: fc.llm_host,
-            bearer_token: fc.bearer_token,
-            x_api_key: fc.api_key,
+            bearer_token,
+            x_api_key,
             token_endpoint: fc.token_endpoint,
             client_id: fc.client_id,
-            client_secret: fc.client_secret,
+            client_secret,
             oauth_scope: fc.oauth_scope,
             ca_cert_path: fc.ca_cert_path,
             insecure_skip_tls_verify: fc.insecure_skip_tls_verify,
@@ -629,7 +653,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         info!("Stored secrets in macOS Keychain (service: {})", KEYCHAIN_SERVICE);
     }
 
-    // Write config file
+    // Write config file (without secrets if keychain is used)
     let cfg_path = config_path();
     if let Some(config_dir) = cfg_path.parent() {
         std::fs::create_dir_all(config_dir)?;
@@ -639,11 +663,11 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         ca_cert_path: config.ca_cert_path.clone(),
         llm_host: config.llm_host.clone(),
         listen_port: config.listen_port,
-        api_key: config.x_api_key.clone(),
-        bearer_token: config.bearer_token.clone(),
+        api_key: if args.use_keychain { String::new() } else { config.x_api_key.clone() },
+        bearer_token: if args.use_keychain { None } else { config.bearer_token.clone() },
         token_endpoint: config.token_endpoint.clone(),
         client_id: config.client_id.clone(),
-        client_secret: config.client_secret.clone(),
+        client_secret: if args.use_keychain { None } else { config.client_secret.clone() },
         oauth_scope: config.oauth_scope.clone(),
         insecure_skip_tls_verify: config.insecure_skip_tls_verify,
     };

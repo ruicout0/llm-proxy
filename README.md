@@ -137,9 +137,10 @@ When installing as a service with `--use-keychain` (default), secrets are stored
 
 - **Service name**: `llm-proxy`
 - **Accounts**: `x-api-key`, `bearer-token`, `client-secret` (separate entries)
-- **Retrieved at runtime** by the service (launchd runs as your user)
+- **Retrieved at runtime** — the proxy reads from keychain first, falling back to config file values
+- Secrets are **not written** to the config file when keychain is enabled
 
-This keeps secrets out of plist files and process listings. The config file only contains non-secret values.
+This keeps secrets out of config files, plists, and process listings.
 
 ## Architecture
 
