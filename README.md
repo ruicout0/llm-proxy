@@ -21,6 +21,9 @@ api_key = "your-x-api-key"
 # Optional (default: 3128)
 listen_port = 3128
 
+# Optional (default: 3129) — health and metrics server, localhost only
+admin_port = 3129
+
 # llm_host can include a path prefix for all upstream requests:
 # llm_host = "api.example.com/llmapi"
 
@@ -93,6 +96,7 @@ llm-proxy uninstall # Remove service (also removes config & keychain entries)
 | `llm_host` | Yes | Target LLM provider hostname (can include path prefix, e.g. `api.example.com/llmapi`) |
 | `api_key` | Yes | Value for `x-apikey` header |
 | `listen_port` | No | Listen port (default: 3128) |
+| `admin_port` | No | Health/metrics port, localhost only (default: 3129) |
 | `m2m_oauth_url` | No* | M2M OAuth token endpoint URL |
 | `client_id` | No* | OAuth client ID |
 | `client_secret` | No* | OAuth client secret |
@@ -180,9 +184,14 @@ localhost:{port} (llm-proxy)
     ├─ Adds: Cache-Control: no-cache, no-store, must-revalidate
     ├─ Sets: Host header (hostname only, path prefix stripped)
     ├─ Auto-refreshes bearer token 60s before expiry
-    ├─ On 401: forces token refresh and retries once
+    ├─ On 401: forces token refresh, waits 200 ms, and retries once
+    ├─ Upstream connect/read/write timeouts
     ▼ HTTPS (with auth headers)
 LLM Provider API
+
+Admin/monitoring endpoints on localhost:{admin_port}
+    ├─ GET /healthz -> 200 OK
+    └─ GET /metrics -> basic runtime metrics
 ```
 
 ## Development

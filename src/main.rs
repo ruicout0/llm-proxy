@@ -32,6 +32,7 @@ use hyper::{
     header::{HeaderValue, AUTHORIZATION, CACHE_CONTROL},
     Body, Method, Request, Response, StatusCode,
 };
+use hyper_timeout::TimeoutConnector;
 use hyper_rustls::HttpsConnector;
 use keyring::Entry;
 use plist::{Dictionary, Value as PlistValue};
@@ -70,6 +71,9 @@ struct ConfigFile {
     /// Port to listen on (default: 3128)
     #[serde(default = "default_port")]
     listen_port: u16,
+    /// Port for admin/health endpoints (default: 3129)
+    #[serde(default = "default_admin_port")]
+    admin_port: u16,
     /// X-API-Key header value (required)
     api_key: String,
     /// M2M OAuth token endpoint URL (for auto-refresh)
@@ -94,6 +98,10 @@ struct ConfigFile {
 
 fn default_port() -> u16 {
     3128
+}
+
+fn default_admin_port() -> u16 {
+    3129
 }
 
 impl ConfigFile {
@@ -177,6 +185,10 @@ struct InstallArgs {
     #[arg(short = 'p', long, default_value = "3128")]
     port: u16,
 
+    /// Admin/health port
+    #[arg(long, default_value = "3129")]
+    admin_port: u16,
+
     /// Use macOS Keychain for secrets (default: true)
     #[arg(long, default_value = "true")]
     use_keychain: bool,
@@ -188,6 +200,7 @@ struct InstallArgs {
 
 struct Config {
     listen_port: u16,
+    admin_port: u16,
     llm_host: String,
     bearer_token: Option<String>,
     x_api_key: String,
@@ -243,6 +256,7 @@ impl Config {
                     fc.client_secret = Some(v.clone());
                 }
                 fc.listen_port = args.port;
+                fc.admin_port = args.admin_port;
             } else {
                 // Create from CLI args only
                 file_config = Some(ConfigFile {
@@ -253,6 +267,7 @@ impl Config {
                     client_id: args.client_id.clone(),
                     client_secret: args.client_secret.clone(),
                     listen_port: args.port,
+                    admin_port: args.admin_port,
                     ca_cert_path: None,
                     oauth_scope: None,
                     insecure_skip_tls_verify: false,
@@ -298,6 +313,7 @@ impl Config {
 
         Ok(Self {
             listen_port: fc.listen_port,
+            admin_port: fc.admin_port,
             llm_host: fc.llm_host,
             bearer_token,
             x_api_key,
@@ -369,6 +385,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
         llm_host,
         api_key,
         listen_port,
+        admin_port: 3129,
         token_endpoint: None,
         client_id: None,
         client_secret: None,
@@ -439,7 +456,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
 struct TokenCache {
     bearer_token: RwLock<Option<(String, Instant)>>,
     config: Arc<Config>,
-    client: Client<HttpsConnector<HttpConnector>>,
+    client: Client<TimeoutConnector<HttpsConnector<HttpConnector>>>,
 }
 
 impl TokenCache {
@@ -488,10 +505,16 @@ impl TokenCache {
             .enable_http1()
             .build();
 
+        let mut connector = TimeoutConnector::new(https);
+        connector.set_connect_timeout(Some(Duration::from_secs(10)));
+        connector.set_read_timeout(Some(Duration::from_secs(60)));
+        connector.set_write_timeout(Some(Duration::from_secs(30)));
+
         let client = Client::builder()
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(4)
-            .build(https);
+            .http1_max_buf_size(64 * 1024)
+            .build(connector);
         Self {
             bearer_token: RwLock::new(None),
             config,
@@ -599,6 +622,8 @@ async fn handle_request(
     token_cache: Arc<TokenCache>,
     config: Arc<Config>,
 ) -> Result<Response<Body>> {
+    let start = Instant::now();
+
     // Capture method and path before consuming req
     let method = req.method().clone();
     let path_and_query = req
@@ -616,7 +641,12 @@ async fn handle_request(
     let bearer = token_cache.get_valid_bearer().await?;
     let x_api_key = token_cache.get_x_api_key().await?;
 
-    let uri: hyper::Uri = format!("https://{}{}", config.llm_host, path_and_query).parse()?;
+    let scheme = if config.insecure_skip_tls_verify {
+        "http"
+    } else {
+        "https"
+    };
+    let uri: hyper::Uri = format!("{}://{}{}", scheme, config.llm_host, path_and_query).parse()?;
     let host_only = config
         .llm_host
         .split('/')
@@ -665,11 +695,14 @@ async fn handle_request(
         method, path_and_query, config.llm_host
     );
 
-    match token_cache.client.request(request).await {
+    let result = match token_cache.client.request(request).await {
         Ok(resp) => {
             if resp.status() == StatusCode::UNAUTHORIZED {
                 warn!("Got 401 from LLM - refreshing token and retrying once");
                 token_cache.clear_token().await;
+
+                // Short backoff before retry to avoid thundering herd
+                tokio::time::sleep(Duration::from_millis(200)).await;
 
                 let fresh_bearer = token_cache.get_valid_bearer().await?;
                 let x_api_key = token_cache.get_x_api_key().await?;
@@ -700,7 +733,19 @@ async fn handle_request(
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("Upstream error"))?)
         }
-    }
+    };
+
+    let status = result.as_ref().map(|r| r.status().as_u16()).unwrap_or(502);
+    let duration_ms = start.elapsed().as_millis();
+    info!(
+        method = %method,
+        path = %path_and_query,
+        status = status,
+        duration_ms = %duration_ms,
+        "proxy request"
+    );
+
+    result
 }
 const SERVICE_LABEL: &str = "com.user.llm-proxy";
 const KEYCHAIN_SERVICE: &str = "llm-proxy";
@@ -762,6 +807,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         ca_cert_path: config.ca_cert_path.clone(),
         llm_host: config.llm_host.clone(),
         listen_port: config.listen_port,
+        admin_port: config.admin_port,
         api_key: if args.use_keychain {
             String::new()
         } else {
@@ -970,7 +1016,9 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     let token_cache = Arc::new(TokenCache::new(config.clone()));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.listen_port));
+    let admin_addr = SocketAddr::from(([127, 0, 0, 1], config.admin_port));
     info!("LLM proxy listening on {}", addr);
+    info!("Admin/health endpoint on {}", admin_addr);
     info!("Target LLM host: {}", config.llm_host);
 
     let make_svc = make_service_fn(move |_| {
@@ -986,10 +1034,37 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     });
 
     let server = Server::bind(&addr).serve(make_svc);
-    info!("Server started, waiting for shutdown signal...");
-    server.with_graceful_shutdown(shutdown_signal()).await?;
+
+    let admin_service =
+        make_service_fn(|_| async { Ok::<_, anyhow::Error>(service_fn(handle_admin_request)) });
+    let admin_server = Server::bind(&admin_addr).serve(admin_service);
+
+    tokio::select! {
+        res = server.with_graceful_shutdown(shutdown_signal()) => {
+            res?;
+        }
+        res = admin_server.with_graceful_shutdown(shutdown_signal()) => {
+            res?;
+        }
+    }
+
     info!("Shutdown complete");
     Ok(())
+}
+
+async fn handle_admin_request(req: Request<Body>) -> Result<Response<Body>> {
+    match req.uri().path() {
+        "/healthz" => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from("ok"))?),
+        "/metrics" => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain")
+            .body(Body::from("# No metrics yet"))?),
+        _ => Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("Not found"))?),
+    }
 }
 
 async fn shutdown_signal() {
@@ -1027,6 +1102,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
 
     #[test]
     fn config_file_parses_valid_toml() {
@@ -1093,6 +1169,7 @@ bearer_token = "token"
 "#;
         let cfg: ConfigFile = toml::from_str(content).unwrap();
         assert_eq!(cfg.listen_port, 3128);
+        assert_eq!(cfg.admin_port, 3129);
         assert!(cfg.token_endpoint.is_none());
         assert!(cfg.ca_cert_path.is_none());
         assert!(!cfg.insecure_skip_tls_verify);
@@ -1104,6 +1181,7 @@ bearer_token = "token"
         rt.block_on(async {
             let config = Arc::new(Config {
                 listen_port: 3128,
+                admin_port: 3129,
                 llm_host: "api.example.com".into(),
                 bearer_token: Some("static-token".into()),
                 x_api_key: "key".into(),
@@ -1126,6 +1204,7 @@ bearer_token = "token"
         rt.block_on(async {
             let config = Arc::new(Config {
                 listen_port: 3128,
+                admin_port: 3129,
                 llm_host: "api.example.com".into(),
                 bearer_token: Some("static-token".into()),
                 x_api_key: "key".into(),
@@ -1153,6 +1232,7 @@ bearer_token = "token"
         rt.block_on(async {
             let config = Arc::new(Config {
                 listen_port: 3128,
+                admin_port: 3129,
                 llm_host: "api.example.com".into(),
                 bearer_token: Some("token".into()),
                 x_api_key: "my-api-key".into(),
@@ -1180,5 +1260,107 @@ insecure_skip_tls_verify = true
         let cfg: ConfigFile = toml::from_str(content).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.insecure_skip_tls_verify);
+    }
+
+    #[tokio::test]
+    async fn admin_healthz_returns_ok() {
+        let req = Request::builder().uri("/healthz").body(Body::empty()).unwrap();
+        let resp = handle_admin_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body()).await.unwrap();
+        assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn admin_unknown_path_returns_404() {
+        let req = Request::builder().uri("/unknown").body(Body::empty()).unwrap();
+        let resp = handle_admin_request(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn handle_request_injects_auth_headers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Mock upstream that asserts injected headers
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let bind = Server::bind(&addr);
+        let port = bind.local_addr().port();
+
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let make_svc = make_service_fn({
+            let count = request_count.clone();
+            move |_conn| {
+                let count = count.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |req: Request<Body>| {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let auth = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let api_key = req
+                            .headers()
+                            .get("x-apikey")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let cache_control = req
+                            .headers()
+                            .get("cache-control")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let host = req
+                            .headers()
+                            .get("host")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        assert!(auth.starts_with("Bearer "));
+                        assert_eq!(api_key, "test-api-key");
+                        assert_eq!(cache_control, "no-cache, no-store, must-revalidate");
+                        // Host is set to the configured llm_host value
+                        assert_eq!(host, format!("127.0.0.1:{}", port));
+                        Ok::<_, Infallible>(Response::new(Body::from("{\"models\": []}")))
+                    }
+                }))
+            }
+        }        });
+
+        let server = bind.serve(make_svc);
+
+        tokio::spawn(async move {
+            server.await.unwrap();
+        });
+
+        let config = Arc::new(Config {
+            listen_port: 3128,
+            admin_port: 3129,
+            llm_host: format!("127.0.0.1:{}", port),
+            bearer_token: Some("static-bearer".into()),
+            x_api_key: "test-api-key".into(),
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
+            oauth_scope: None,
+            ca_cert_path: None,
+            insecure_skip_tls_verify: true,
+        });
+        let cache = Arc::new(TokenCache::new(config.clone()));
+
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("http://localhost/v1/models")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = handle_request(req, cache, config).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(request_count.load(Ordering::SeqCst), 1);
     }
 }
