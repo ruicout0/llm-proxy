@@ -551,7 +551,10 @@ impl UsageStore {
         for (token_type, count) in tokens {
             if count > 0 {
                 *model_usage.tokens.entry(token_type.clone()).or_default() += count;
-                *group.totals.entry(format!("{}_tokens", token_type)).or_default() += count as f64;
+                *group
+                    .totals
+                    .entry(format!("{}_tokens", token_type))
+                    .or_default() += count as f64;
             }
         }
 
@@ -583,8 +586,9 @@ impl UsageStore {
 
     fn persist_sync(&self, data: &UsageStoreData) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create usage store dir: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create usage store dir: {}", parent.display())
+            })?;
         }
         let json = serde_json::to_string_pretty(data)?;
         std::fs::write(&self.path, json)
@@ -1673,7 +1677,12 @@ insecure_skip_tls_verify = true
                 let mut tokens = BTreeMap::new();
                 tokens.insert("input_tokens".to_string(), 10_u64);
                 store
-                    .record("default", "claude-opus", Some((0.005, "USD".into())), tokens)
+                    .record(
+                        "default",
+                        "claude-opus",
+                        Some((0.005, "USD".into())),
+                        tokens,
+                    )
                     .await
                     .unwrap();
             }
