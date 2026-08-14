@@ -551,7 +551,10 @@ impl UsageStore {
         for (token_type, count) in tokens {
             if count > 0 {
                 *model_usage.tokens.entry(token_type.clone()).or_default() += count;
-                *group.totals.entry(format!("{}_tokens", token_type)).or_default() += count as f64;
+                *group
+                    .totals
+                    .entry(format!("{}_tokens", token_type))
+                    .or_default() += count as f64;
             }
         }
 
@@ -583,8 +586,9 @@ impl UsageStore {
 
     fn persist_sync(&self, data: &UsageStoreData) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create usage store dir: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create usage store dir: {}", parent.display())
+            })?;
         }
         let json = serde_json::to_string_pretty(data)?;
         std::fs::write(&self.path, json)
@@ -974,6 +978,11 @@ async fn handle_request(
     let group = resolve_usage_group(&parts.headers);
     let body_bytes = to_bytes(body).await?;
 
+    // Extract request model for usage tracking fallback
+    let request_model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(|s| s.to_string()));
+
     // Always inject auth headers and forward to configured LLM host
     let bearer = token_cache.get_valid_bearer().await?;
     let x_api_key = token_cache.get_x_api_key().await?;
@@ -1062,8 +1071,9 @@ async fn handle_request(
                         let model = json["model"]
                             .as_str()
                             .or_else(|| json["model_id"].as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
+                            .map(|s| s.to_string())
+                            .or_else(|| request_model.clone())
+                            .unwrap_or_else(|| "unknown".to_string());
                         let cost = json["cost"]["total"]
                             .as_f64()
                             .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()));
@@ -1075,6 +1085,10 @@ async fn handle_request(
                                 }
                             }
                         }
+                        debug!(
+                            "Recorded usage for group={} model={} cost={:?}",
+                            group, model, cost
+                        );
                         if let Err(e) = usage_store.record(&group, &model, cost, tokens).await {
                             warn!("Failed to record usage: {}", e);
                         }
@@ -1663,7 +1677,12 @@ insecure_skip_tls_verify = true
                 let mut tokens = BTreeMap::new();
                 tokens.insert("input_tokens".to_string(), 10_u64);
                 store
-                    .record("default", "claude-opus", Some((0.005, "USD".into())), tokens)
+                    .record(
+                        "default",
+                        "claude-opus",
+                        Some((0.005, "USD".into())),
+                        tokens,
+                    )
                     .await
                     .unwrap();
             }
@@ -1673,6 +1692,25 @@ insecure_skip_tls_verify = true
             assert_eq!(data.global_requests, 1);
             assert_eq!(data.global_totals.get("USD").unwrap(), &0.005);
         });
+    }
+
+    #[test]
+    fn model_fallback_uses_request_body_when_response_omits_model() {
+        let response_body = r#"{
+            "cost": {"total": 0.002, "currency": "USD"},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        }"#;
+        let response_json: serde_json::Value = serde_json::from_str(response_body).unwrap();
+        let request_model = Some("gpt-4o-mini".to_string());
+
+        let model = response_json["model"]
+            .as_str()
+            .or_else(|| response_json["model_id"].as_str())
+            .map(|s| s.to_string())
+            .or_else(|| request_model.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        assert_eq!(model, "gpt-4o-mini");
     }
 
     #[test]
