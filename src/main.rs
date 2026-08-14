@@ -551,7 +551,10 @@ impl UsageStore {
         for (token_type, count) in tokens {
             if count > 0 {
                 *model_usage.tokens.entry(token_type.clone()).or_default() += count;
-                *group.totals.entry(format!("{}_tokens", token_type)).or_default() += count as f64;
+                *group
+                    .totals
+                    .entry(format!("{}_tokens", token_type))
+                    .or_default() += count as f64;
             }
         }
 
@@ -583,8 +586,9 @@ impl UsageStore {
 
     fn persist_sync(&self, data: &UsageStoreData) -> Result<()> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create usage store dir: {}", parent.display()))?;
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create usage store dir: {}", parent.display())
+            })?;
         }
         let json = serde_json::to_string_pretty(data)?;
         std::fs::write(&self.path, json)
@@ -938,12 +942,75 @@ impl TokenCache {
     }
 }
 
+async fn record_usage_from_response(
+    resp: Response<Body>,
+    usage_store: &UsageStore,
+    group: &str,
+    request_model: Option<&str>,
+) -> Result<Response<Body>> {
+    debug!("Entering record_usage_from_response");
+    let (parts, body) = resp.into_parts();
+    debug!("Reading response body for usage tracking");
+    let body_bytes = to_bytes(body).await?;
+    debug!("Response body read: len={}", body_bytes.len());
+
+    debug!(
+        "Usage tracking check: status={} body_len={} request_model={:?}",
+        parts.status,
+        body_bytes.len(),
+        request_model
+    );
+    if parts.status.is_success() {
+        match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+            Ok(json) => {
+                let model = json["model"]
+                    .as_str()
+                    .or_else(|| json["model_id"].as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| request_model.map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let cost = json["cost"]["total"]
+                    .as_f64()
+                    .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()));
+                let mut tokens = BTreeMap::new();
+                if let Some(obj) = json["usage"].as_object() {
+                    for (k, v) in obj {
+                        if let Some(n) = v.as_u64() {
+                            tokens.insert(k.clone(), n);
+                        }
+                    }
+                }
+                debug!(
+                    "Recorded usage for group={} model={} cost={:?}",
+                    group, model, cost
+                );
+                if let Err(e) = usage_store.record(group, &model, cost, tokens).await {
+                    warn!("Failed to record usage: {}", e);
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to parse upstream response as JSON for usage tracking: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(Response::from_parts(parts, Body::from(body_bytes)))
+}
+
 async fn handle_request(
     req: Request<Body>,
     token_cache: Arc<TokenCache>,
     usage_store: Arc<UsageStore>,
     config: Arc<Config>,
 ) -> Result<Response<Body>> {
+    debug!(
+        "handle_request start: method={} uri={}",
+        req.method(),
+        req.uri()
+    );
     // Capture method and path before consuming req
     let method = req.method().clone();
     let path_and_query = req
@@ -974,10 +1041,33 @@ async fn handle_request(
     let group = resolve_usage_group(&parts.headers);
     let body_bytes = to_bytes(body).await?;
 
-    // Extract request model for usage tracking fallback
+    // Extract request model for usage tracking fallback from multiple sources
     let request_model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
         .ok()
-        .and_then(|v| v["model"].as_str().map(|s| s.to_string()));
+        .and_then(|v| {
+            v["model"]
+                .as_str()
+                .or_else(|| v["model_id"].as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            parts.uri.query().and_then(|q| {
+                q.split('&').find_map(|pair| {
+                    let mut it = pair.splitn(2, '=');
+                    if it.next()? == "model" {
+                        it.next().map(|v| v.replace('+', " "))
+                    } else {
+                        None
+                    }
+                })
+            })
+        })
+        .or_else(|| {
+            parts
+                .headers
+                .get("x-model")
+                .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
+        });
 
     // Always inject auth headers and forward to configured LLM host
     let bearer = token_cache.get_valid_bearer().await?;
@@ -1028,12 +1118,14 @@ async fn handle_request(
 
     let request = build_request(&bearer, &x_api_key)?;
     debug!(
-        "Forwarding {} {} to {}",
-        method, path_and_query, config.llm_host
+        "Forwarding {} {} to {} (group={} request_model={:?})",
+        method, path_and_query, config.llm_host, group, request_model
     );
 
-    match token_cache.client.request(request).await {
+    debug!("Sending upstream request");
+    let result = match token_cache.client.request(request).await {
         Ok(resp) => {
+            debug!("Upstream response received: status={}", resp.status());
             if resp.status() == StatusCode::UNAUTHORIZED {
                 warn!("Got 401 from LLM - refreshing token and retrying once");
                 token_cache.clear_token().await;
@@ -1048,7 +1140,15 @@ async fn handle_request(
                         if retry_resp.status() == StatusCode::UNAUTHORIZED {
                             warn!("Still got 401 after token refresh");
                         }
-                        Ok(retry_resp)
+                        // Record usage on successful retry too
+                        let result = record_usage_from_response(
+                            retry_resp,
+                            &usage_store,
+                            &group,
+                            request_model.as_deref(),
+                        )
+                        .await;
+                        result
                     }
                     Err(e) => {
                         error!("Retry request failed: {}", e);
@@ -1058,40 +1158,14 @@ async fn handle_request(
                     }
                 }
             } else {
-                let (parts, body) = resp.into_parts();
-                let body_bytes = to_bytes(body).await?;
-
-                // Best-effort usage tracking on successful responses
-                if parts.status.is_success() {
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-                        let model = json["model"]
-                            .as_str()
-                            .or_else(|| json["model_id"].as_str())
-                            .map(|s| s.to_string())
-                            .or_else(|| request_model.clone())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let cost = json["cost"]["total"]
-                            .as_f64()
-                            .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()));
-                        let mut tokens = BTreeMap::new();
-                        if let Some(obj) = json["usage"].as_object() {
-                            for (k, v) in obj {
-                                if let Some(n) = v.as_u64() {
-                                    tokens.insert(k.clone(), n);
-                                }
-                            }
-                        }
-                        debug!(
-                            "Recorded usage for group={} model={} cost={:?}",
-                            group, model, cost
-                        );
-                        if let Err(e) = usage_store.record(&group, &model, cost, tokens).await {
-                            warn!("Failed to record usage: {}", e);
-                        }
-                    }
-                }
-
-                Ok(Response::from_parts(parts, Body::from(body_bytes)))
+                let result = record_usage_from_response(
+                    resp,
+                    &usage_store,
+                    &group,
+                    request_model.as_deref(),
+                )
+                .await;
+                result
             }
         }
         Err(e) => {
@@ -1100,7 +1174,12 @@ async fn handle_request(
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("Upstream error"))?)
         }
-    }
+    };
+    debug!(
+        "handle_request end: result_status={:?}",
+        result.as_ref().map(|r| r.status())
+    );
+    result
 }
 const SERVICE_LABEL: &str = "com.user.llm-proxy";
 const KEYCHAIN_SERVICE: &str = "llm-proxy";
@@ -1673,7 +1752,12 @@ insecure_skip_tls_verify = true
                 let mut tokens = BTreeMap::new();
                 tokens.insert("input_tokens".to_string(), 10_u64);
                 store
-                    .record("default", "claude-opus", Some((0.005, "USD".into())), tokens)
+                    .record(
+                        "default",
+                        "claude-opus",
+                        Some((0.005, "USD".into())),
+                        tokens,
+                    )
                     .await
                     .unwrap();
             }
@@ -1692,16 +1776,68 @@ insecure_skip_tls_verify = true
             "usage": {"prompt_tokens": 10, "completion_tokens": 5}
         }"#;
         let response_json: serde_json::Value = serde_json::from_str(response_body).unwrap();
-        let request_model = Some("gpt-4o-mini".to_string());
 
-        let model = response_json["model"]
+        let resolve = |req: &str, query: Option<&str>, header: Option<&str>| {
+            let parsed: Option<serde_json::Value> = serde_json::from_str(req).ok();
+            parsed
+                .as_ref()
+                .and_then(|v| {
+                    v["model"]
+                        .as_str()
+                        .or_else(|| v["model_id"].as_str())
+                        .map(|s| s.to_string())
+                })
+                .or_else(|| {
+                    query.and_then(|q| {
+                        q.split('&').find_map(|pair| {
+                            let mut it = pair.splitn(2, '=');
+                            if it.next()? == "model" {
+                                it.next().map(|v| v.replace('+', " "))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                })
+                .or_else(|| header.map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown".to_string())
+        };
+
+        // Body fallback
+        assert_eq!(
+            resolve(r#"{"model":"gpt-4o-mini"}"#, None, None),
+            "gpt-4o-mini"
+        );
+
+        // Query fallback
+        assert_eq!(
+            resolve("{}", Some("model=claude-3-5-sonnet"), None),
+            "claude-3-5-sonnet"
+        );
+
+        // Header fallback
+        assert_eq!(
+            resolve("{}", None, Some("custom-model-v1")),
+            "custom-model-v1"
+        );
+
+        // When response has no model, fallback is used
+        assert_eq!(
+            resolve_with_response(&response_json, Some("gpt-4o-mini".to_string())),
+            "gpt-4o-mini"
+        );
+    }
+
+    fn resolve_with_response(
+        response_json: &serde_json::Value,
+        request_model: Option<String>,
+    ) -> String {
+        response_json["model"]
             .as_str()
             .or_else(|| response_json["model_id"].as_str())
             .map(|s| s.to_string())
             .or_else(|| request_model.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        assert_eq!(model, "gpt-4o-mini");
+            .unwrap_or_else(|| "unknown".to_string())
     }
 
     #[test]
