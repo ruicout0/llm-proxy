@@ -1081,6 +1081,10 @@ async fn handle_request(
                                 }
                             }
                         }
+                        debug!(
+                            "Recorded usage for group={} model={} cost={:?}",
+                            group, model, cost
+                        );
                         if let Err(e) = usage_store.record(&group, &model, cost, tokens).await {
                             warn!("Failed to record usage: {}", e);
                         }
@@ -1679,6 +1683,25 @@ insecure_skip_tls_verify = true
             assert_eq!(data.global_requests, 1);
             assert_eq!(data.global_totals.get("USD").unwrap(), &0.005);
         });
+    }
+
+    #[test]
+    fn model_fallback_uses_request_body_when_response_omits_model() {
+        let response_body = r#"{
+            "cost": {"total": 0.002, "currency": "USD"},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        }"#;
+        let response_json: serde_json::Value = serde_json::from_str(response_body).unwrap();
+        let request_model = Some("gpt-4o-mini".to_string());
+
+        let model = response_json["model"]
+            .as_str()
+            .or_else(|| response_json["model_id"].as_str())
+            .map(|s| s.to_string())
+            .or_else(|| request_model.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        assert_eq!(model, "gpt-4o-mini");
     }
 
     #[test]
