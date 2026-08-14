@@ -36,10 +36,11 @@ use hyper_rustls::HttpsConnector;
 use keyring::Entry;
 use plist::{Dictionary, Value as PlistValue};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -90,10 +91,19 @@ struct ConfigFile {
     /// Skip TLS certificate verification for upstream LLM host
     #[serde(default)]
     insecure_skip_tls_verify: bool,
+    /// Path to usage/cost tracking JSON store
+    #[serde(default)]
+    usage_store_path: Option<String>,
 }
 
 fn default_port() -> u16 {
     3128
+}
+
+fn default_usage_store_path() -> PathBuf {
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/llm-proxy/usage.json")
 }
 
 impl ConfigFile {
@@ -143,8 +153,21 @@ enum Command {
     Status,
     /// Follow service logs
     Logs,
+    /// Show accumulated usage/cost totals
+    Usage(UsageArgs),
     /// Uninstall the service
     Uninstall,
+}
+
+#[derive(Parser)]
+struct UsageArgs {
+    /// Path to usage store JSON (overrides config)
+    #[arg(short = 'p', long)]
+    store_path: Option<PathBuf>,
+
+    /// Reset all usage data
+    #[arg(long)]
+    reset: bool,
 }
 
 #[derive(Parser)]
@@ -197,6 +220,7 @@ struct Config {
     oauth_scope: Option<String>,
     ca_cert_path: Option<String>,
     insecure_skip_tls_verify: bool,
+    usage_store_path: PathBuf,
 }
 
 impl Config {
@@ -256,6 +280,7 @@ impl Config {
                     ca_cert_path: None,
                     oauth_scope: None,
                     insecure_skip_tls_verify: false,
+                    usage_store_path: None,
                 });
                 file_config.as_ref().unwrap().validate()?;
             }
@@ -307,6 +332,10 @@ impl Config {
             oauth_scope: fc.oauth_scope,
             ca_cert_path: fc.ca_cert_path,
             insecure_skip_tls_verify: fc.insecure_skip_tls_verify,
+            usage_store_path: fc
+                .usage_store_path
+                .map(PathBuf::from)
+                .unwrap_or_else(default_usage_store_path),
         })
     }
 }
@@ -375,6 +404,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
         oauth_scope: None,
         insecure_skip_tls_verify: false,
         bearer_token: None,
+        usage_store_path: None,
     };
 
     if auth_choice == 0 {
@@ -430,6 +460,320 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
     println!("  llm-proxy install       # Install as service (uses config file)");
 
     Ok(())
+}
+
+// ============================================================================
+// Usage Tracking
+// ============================================================================
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
+struct ModelUsage {
+    requests: u64,
+    #[serde(default)]
+    cost: BTreeMap<String, f64>,
+    #[serde(default)]
+    tokens: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
+struct GroupUsage {
+    requests: u64,
+    #[serde(default)]
+    models: BTreeMap<String, ModelUsage>,
+    #[serde(default)]
+    totals: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
+struct UsageStoreData {
+    #[serde(default)]
+    groups: BTreeMap<String, GroupUsage>,
+    #[serde(default)]
+    global_requests: u64,
+    #[serde(default)]
+    global_totals: BTreeMap<String, f64>,
+    last_updated: Option<u64>,
+}
+
+impl UsageStoreData {
+    fn touch_last_updated(&mut self) {
+        self.last_updated = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+    }
+}
+
+struct UsageStore {
+    data: RwLock<UsageStoreData>,
+    path: PathBuf,
+}
+
+impl UsageStore {
+    fn new(path: PathBuf) -> Self {
+        let data = if path.exists() {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<UsageStoreData>(&s).ok())
+                .unwrap_or_default()
+        } else {
+            UsageStoreData::default()
+        };
+        Self {
+            data: RwLock::new(data),
+            path,
+        }
+    }
+
+    async fn record(
+        &self,
+        group: &str,
+        model: &str,
+        cost: Option<(f64, String)>,
+        tokens: BTreeMap<String, u64>,
+    ) -> Result<()> {
+        let mut data = self.data.write().await;
+        data.global_requests += 1;
+
+        let group = data.groups.entry(group.to_string()).or_default();
+        group.requests += 1;
+
+        let model_usage = group.models.entry(model.to_string()).or_default();
+        model_usage.requests += 1;
+
+        if let Some((amount, currency)) = cost {
+            if amount > 0.0 {
+                *model_usage.cost.entry(currency.clone()).or_default() += amount;
+                *group.totals.entry(currency.clone()).or_default() += amount;
+            }
+        }
+
+        for (token_type, count) in tokens {
+            if count > 0 {
+                *model_usage.tokens.entry(token_type.clone()).or_default() += count;
+                *group.totals.entry(format!("{}_tokens", token_type)).or_default() += count as f64;
+            }
+        }
+
+        // Recalculate global totals from groups to avoid multiple mutable borrows
+        let mut global_totals = BTreeMap::new();
+        for group in data.groups.values() {
+            for (currency, amount) in &group.totals {
+                *global_totals.entry(currency.clone()).or_default() += amount;
+            }
+        }
+        data.global_totals = global_totals;
+
+        data.touch_last_updated();
+        self.persist_sync(&data)?;
+        Ok(())
+    }
+
+    async fn get(&self) -> UsageStoreData {
+        self.data.read().await.clone()
+    }
+
+    async fn reset(&self) -> Result<()> {
+        let mut data = self.data.write().await;
+        *data = UsageStoreData::default();
+        data.touch_last_updated();
+        self.persist_sync(&data)?;
+        Ok(())
+    }
+
+    fn persist_sync(&self, data: &UsageStoreData) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create usage store dir: {}", parent.display()))?;
+        }
+        let json = serde_json::to_string_pretty(data)?;
+        std::fs::write(&self.path, json)
+            .with_context(|| format!("Failed to write usage store: {}", self.path.display()))?;
+        Ok(())
+    }
+}
+
+fn resolve_usage_group(headers: &hyper::HeaderMap) -> String {
+    if let Some(value) = headers.get("x-usage-group").and_then(|v| v.to_str().ok()) {
+        if !value.is_empty() {
+            return value.to_string();
+        }
+    }
+
+    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        let normalized = value.trim().to_lowercase();
+        if !normalized.is_empty() {
+            return format!("auth:{}", sha256_hex(normalized.as_bytes()));
+        }
+    }
+
+    if let Some(value) = headers.get("x-apikey").and_then(|v| v.to_str().ok()) {
+        if !value.is_empty() {
+            return format!("apikey:{}", sha256_hex(value.as_bytes()));
+        }
+    }
+
+    "default".to_string()
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn usage_dashboard_html() -> &'static str {
+    r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Proxy Usage</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --panel-2: #27354f;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --accent-2: #818cf8;
+      --success: #34d399;
+      --danger: #f87171;
+      --border: #334155;
+      --radius: 14px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+    header { margin-bottom: 28px; }
+    h1 { margin: 0 0 6px; font-size: 1.75rem; letter-spacing: -0.02em; }
+    .subtitle { color: var(--muted); font-size: 0.95rem; }
+    .refresh { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 28px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+    }
+    .card h3 { margin: 0 0 6px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+    .card .value { font-size: 1.7rem; font-weight: 700; color: var(--text); }
+    .card .value.accent { color: var(--accent); }
+    .card .value.success { color: var(--success); }
+    .card .value.danger { color: var(--danger); }
+    section { margin-bottom: 28px; }
+    h2 { font-size: 1.15rem; margin: 0 0 14px; display: flex; align-items: center; gap: 8px; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+    th { background: var(--panel-2); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(255,255,255,0.03); }
+    .tag { display: inline-block; padding: 3px 8px; border-radius: 999px; background: var(--panel-2); font-size: 0.75rem; color: var(--accent); border: 1px solid var(--border); }
+    .empty { color: var(--muted); font-style: italic; padding: 20px; text-align: center; }
+    .right { text-align: right; }
+    .last-updated { color: var(--muted); font-size: 0.8rem; margin-top: 12px; }
+    @media (max-width: 600px) {
+      .container { padding: 20px 14px; }
+      th, td { padding: 10px 12px; font-size: 0.85rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🧠 LLM Proxy Usage</h1>
+      <div class="subtitle">Live cost and token totals from proxied requests</div>
+      <div class="refresh">Auto-refresh every 30s · <a href="/llm-proxy/usage" style="color:var(--accent)">JSON API</a></div>
+    </header>
+
+    <div class="grid" id="summary">
+      <div class="card"><h3>Total Requests</h3><div class="value accent" id="total-requests">–</div></div>
+      <div class="card"><h3>Total Cost</h3><div class="value success" id="total-cost">–</div></div>
+      <div class="card"><h3>Active Groups</h3><div class="value" id="active-groups">–</div></div>
+      <div class="card"><h3>Models Used</h3><div class="value" id="models-used">–</div></div>
+    </div>
+
+    <section>
+      <h2>📊 Per-Group / Per-Model</h2>
+      <table id="details-table">
+        <thead>
+          <tr><th>Group</th><th>Model</th><th class="right">Requests</th><th class="right">Cost</th><th class="right">Tokens</th></tr>
+        </thead>
+        <tbody id="details-body"><tr><td colspan="5" class="empty">No usage recorded yet.</td></tr></tbody>
+      </table>
+      <div class="last-updated" id="last-updated"></div>
+    </section>
+  </div>
+
+  <script>
+    const fmt = (n) => typeof n === 'number' ? n.toLocaleString() : '–';
+    const fmtCost = (n, c) => typeof n === 'number' ? `${n.toFixed(6)} ${c || 'USD'}` : '–';
+
+    async function load() {
+      try {
+        const res = await fetch('/llm-proxy/usage');
+        const data = await res.json();
+
+        document.getElementById('total-requests').textContent = fmt(data.global_requests);
+
+        const costEntries = Object.entries(data.global_totals || {}).filter(([k]) => !k.endsWith('_tokens'));
+        document.getElementById('total-cost').textContent = costEntries.length
+          ? costEntries.map(([c, a]) => fmtCost(a, c)).join(' + ')
+          : '$0.000000';
+
+        const groups = Object.entries(data.groups || {});
+        document.getElementById('active-groups').textContent = groups.length;
+
+        let modelCount = 0;
+        const tbody = document.getElementById('details-body');
+        tbody.innerHTML = '';
+
+        if (groups.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" class="empty">No usage recorded yet.</td></tr>';
+        } else {
+          for (const [groupName, group] of groups) {
+            const models = Object.entries(group.models || {});
+            modelCount += models.length;
+            for (const [modelName, model] of models) {
+              const cost = Object.entries(model.cost || {})
+                .filter(([k]) => !k.endsWith('_tokens'))
+                .map(([c, a]) => fmtCost(a, c))
+                .join(' + ') || '–';
+              const tokens = Object.entries(model.tokens || {})
+                .map(([t, n]) => `${t}: ${fmt(n)}`)
+                .join('<br>') || '–';
+              const row = document.createElement('tr');
+              row.innerHTML = `<td><span class="tag">${groupName}</span></td><td>${modelName}</td><td class="right">${fmt(model.requests)}</td><td class="right">${cost}</td><td class="right">${tokens}</td>`;
+              tbody.appendChild(row);
+            }
+          }
+        }
+        document.getElementById('models-used').textContent = modelCount;
+
+        const ts = data.last_updated
+          ? new Date(data.last_updated * 1000).toLocaleString()
+          : 'never';
+        document.getElementById('last-updated').textContent = 'Last updated: ' + ts;
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>"##
 }
 
 // ============================================================================
@@ -597,6 +941,7 @@ impl TokenCache {
 async fn handle_request(
     req: Request<Body>,
     token_cache: Arc<TokenCache>,
+    usage_store: Arc<UsageStore>,
     config: Arc<Config>,
 ) -> Result<Response<Body>> {
     // Capture method and path before consuming req
@@ -608,8 +953,25 @@ async fn handle_request(
         .unwrap_or("/")
         .to_string();
 
+    // Local usage endpoints
+    if method == Method::GET && path_and_query == "/llm-proxy/usage" {
+        let data = usage_store.get().await;
+        let body = serde_json::to_string_pretty(&data)?;
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))?);
+    }
+    if method == Method::GET && path_and_query == "/llm-proxy/usage/dashboard" {
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/html; charset=utf-8")
+            .body(Body::from(usage_dashboard_html()))?);
+    }
+
     // Buffer the body so we can replay it on 401 retry
     let (parts, body) = req.into_parts();
+    let group = resolve_usage_group(&parts.headers);
     let body_bytes = to_bytes(body).await?;
 
     // Always inject auth headers and forward to configured LLM host
@@ -691,7 +1053,35 @@ async fn handle_request(
                     }
                 }
             } else {
-                Ok(resp)
+                let (parts, body) = resp.into_parts();
+                let body_bytes = to_bytes(body).await?;
+
+                // Best-effort usage tracking on successful responses
+                if parts.status.is_success() {
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                        let model = json["model"]
+                            .as_str()
+                            .or_else(|| json["model_id"].as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let cost = json["cost"]["total"]
+                            .as_f64()
+                            .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()));
+                        let mut tokens = BTreeMap::new();
+                        if let Some(obj) = json["usage"].as_object() {
+                            for (k, v) in obj {
+                                if let Some(n) = v.as_u64() {
+                                    tokens.insert(k.clone(), n);
+                                }
+                            }
+                        }
+                        if let Err(e) = usage_store.record(&group, &model, cost, tokens).await {
+                            warn!("Failed to record usage: {}", e);
+                        }
+                    }
+                }
+
+                Ok(Response::from_parts(parts, Body::from(body_bytes)))
             }
         }
         Err(e) => {
@@ -781,6 +1171,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         },
         oauth_scope: config.oauth_scope.clone(),
         insecure_skip_tls_verify: config.insecure_skip_tls_verify,
+        usage_store_path: Some(config.usage_store_path.to_string_lossy().to_string()),
     };
     let toml_str = toml::to_string_pretty(&config_file_content)?;
     std::fs::write(&cfg_path, toml_str)?;
@@ -911,6 +1302,48 @@ fn logs_service() -> Result<()> {
     Ok(())
 }
 
+async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<()> {
+    let store_path = args
+        .store_path
+        .or_else(|| {
+            Config::load(config_file.clone(), None)
+                .ok()
+                .map(|c| c.usage_store_path)
+        })
+        .unwrap_or_else(default_usage_store_path);
+
+    let store = UsageStore::new(store_path.clone());
+
+    if args.reset {
+        store.reset().await?;
+        println!("Usage store reset: {}", store_path.display());
+        return Ok(());
+    }
+
+    let data = store.get().await;
+    println!("Usage store: {}", store_path.display());
+    println!("Global requests: {}", data.global_requests);
+    println!("Global totals:");
+    for (currency, amount) in &data.global_totals {
+        println!("  {}: {:.10}", currency, amount);
+    }
+
+    for (group, group_usage) in &data.groups {
+        println!("\nGroup: {} ({} requests)", group, group_usage.requests);
+        for (model, model_usage) in &group_usage.models {
+            println!("  Model: {} ({} requests)", model, model_usage.requests);
+            for (currency, amount) in &model_usage.cost {
+                println!("    cost {}: {:.10}", currency, amount);
+            }
+            for (token_type, count) in &model_usage.tokens {
+                println!("    {}: {}", token_type, count);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn uninstall_service() -> Result<()> {
     let _ = stop_service();
     let path = plist_path()?;
@@ -960,6 +1393,7 @@ async fn main() -> Result<()> {
         Command::Restart => restart_service(),
         Command::Status => status_service(),
         Command::Logs => logs_service(),
+        Command::Usage(args) => usage_command(args, cli.config).await,
         Command::Uninstall => uninstall_service(),
     }
 }
@@ -968,6 +1402,7 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     let config = Arc::new(Config::load(config_file, None)?);
 
     let token_cache = Arc::new(TokenCache::new(config.clone()));
+    let usage_store = Arc::new(UsageStore::new(config.usage_store_path.clone()));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.listen_port));
     info!("LLM proxy listening on {}", addr);
@@ -975,12 +1410,14 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
 
     let make_svc = make_service_fn(move |_| {
         let token_cache = token_cache.clone();
+        let usage_store = usage_store.clone();
         let config = config.clone();
         async move {
             Ok::<_, anyhow::Error>(service_fn(move |req| {
                 let token_cache = token_cache.clone();
+                let usage_store = usage_store.clone();
                 let config = config.clone();
-                async move { handle_request(req, token_cache, config).await }
+                async move { handle_request(req, token_cache, usage_store, config).await }
             }))
         }
     });
@@ -1113,6 +1550,7 @@ bearer_token = "token"
                 oauth_scope: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
+                usage_store_path: PathBuf::from("/tmp/llm-proxy-test-usage.json"),
             });
             let cache = TokenCache::new(config);
             let token = cache.get_valid_bearer().await.unwrap();
@@ -1135,6 +1573,7 @@ bearer_token = "token"
                 oauth_scope: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
+                usage_store_path: PathBuf::from("/tmp/llm-proxy-test-usage.json"),
             });
             let cache = TokenCache::new(config);
             // First call populates
@@ -1162,6 +1601,7 @@ bearer_token = "token"
                 oauth_scope: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
+                usage_store_path: PathBuf::from("/tmp/llm-proxy-test-usage.json"),
             });
             let cache = TokenCache::new(config);
             let key = cache.get_x_api_key().await.unwrap();
@@ -1180,5 +1620,88 @@ insecure_skip_tls_verify = true
         let cfg: ConfigFile = toml::from_str(content).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.insecure_skip_tls_verify);
+    }
+
+    #[test]
+    fn usage_store_records_group_model_cost_and_tokens() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let store = UsageStore::new(tmp.path().to_path_buf());
+
+            let mut tokens = BTreeMap::new();
+            tokens.insert("prompt_tokens".to_string(), 100_u64);
+            tokens.insert("completion_tokens".to_string(), 50_u64);
+            store
+                .record("team-a", "gpt-4o", Some((0.00123, "USD".into())), tokens)
+                .await
+                .unwrap();
+
+            let data = store.get().await;
+            assert_eq!(data.global_requests, 1);
+            assert_eq!(data.global_totals.get("USD").unwrap(), &0.00123);
+
+            let group = data.groups.get("team-a").unwrap();
+            assert_eq!(group.requests, 1);
+            let model = group.models.get("gpt-4o").unwrap();
+            assert_eq!(model.requests, 1);
+            assert_eq!(model.cost.get("USD").unwrap(), &0.00123);
+            assert_eq!(model.tokens.get("prompt_tokens").unwrap(), &100);
+            assert_eq!(model.tokens.get("completion_tokens").unwrap(), &50);
+        });
+    }
+
+    #[test]
+    fn usage_store_persists_and_loads() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            let path = tmp.path().to_path_buf();
+
+            {
+                let store = UsageStore::new(path.clone());
+                let mut tokens = BTreeMap::new();
+                tokens.insert("input_tokens".to_string(), 10_u64);
+                store
+                    .record("default", "claude-opus", Some((0.005, "USD".into())), tokens)
+                    .await
+                    .unwrap();
+            }
+
+            let store2 = UsageStore::new(path);
+            let data = store2.get().await;
+            assert_eq!(data.global_requests, 1);
+            assert_eq!(data.global_totals.get("USD").unwrap(), &0.005);
+        });
+    }
+
+    #[test]
+    fn resolve_usage_group_uses_header_then_token_then_apikey() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-usage-group", "project-x".parse().unwrap());
+        assert_eq!(resolve_usage_group(&headers), "project-x");
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("authorization", "Bearer abc123".parse().unwrap());
+        assert!(resolve_usage_group(&headers).starts_with("auth:"));
+
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-apikey", "secret-key".parse().unwrap());
+        assert!(resolve_usage_group(&headers).starts_with("apikey:"));
+
+        let headers = hyper::HeaderMap::new();
+        assert_eq!(resolve_usage_group(&headers), "default");
+    }
+
+    #[test]
+    fn config_file_with_usage_store_path() {
+        let content = r#"
+llm_host = "api.example.com"
+api_key = "key"
+bearer_token = "token"
+usage_store_path = "/custom/usage.json"
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        assert_eq!(cfg.usage_store_path, Some("/custom/usage.json".to_string()));
     }
 }

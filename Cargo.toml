@@ -27,6 +27,9 @@ rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rustls-pemfile = "1.0"
 webpki-roots = "0.22"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = 3
 lto = true

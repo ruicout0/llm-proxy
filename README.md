@@ -81,6 +81,8 @@ llm-proxy stop      # Stop service
 llm-proxy restart   # Restart service
 llm-proxy status    # Show status
 llm-proxy logs      # Follow logs
+llm-proxy usage     # Show accumulated usage/cost totals
+llm-proxy usage --reset  # Reset usage store
 llm-proxy uninstall # Remove service (also removes config & keychain entries)
 ```
 
@@ -100,6 +102,7 @@ llm-proxy uninstall # Remove service (also removes config & keychain entries)
 | `bearer_token` | No* | Static bearer token (alternative to OAuth) |
 | `insecure_skip_tls_verify` | No | Skip upstream TLS certificate verification (for internal CAs) |
 | `ca_cert_path` | No | Path to custom CA certificate PEM file for upstream TLS |
+| `usage_store_path` | No | Path to usage/cost JSON store (default: `~/.config/llm-proxy/usage.json`) |
 
 *Either `bearer_token` OR all three of `m2m_oauth_url`, `client_id`, `client_secret` must be provided.
 
@@ -118,6 +121,7 @@ Commands:
   restart    Restart the service
   status     Show service status
   logs       Follow service logs
+  usage      Show accumulated usage/cost totals
   uninstall  Uninstall the service
 
 Install Options:
@@ -197,6 +201,35 @@ curl -X POST http://localhost:3128/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}'
 ```
+
+## Usage Cost Tracking
+
+The proxy records usage and cost from upstream responses automatically. Every successful LLM request updates a local JSON store with:
+
+- Global request count and totals
+- Per-group breakdown (group is resolved from `x-usage-group` → `Authorization` hash → `x-apikey` hash → `default`)
+- Per-model cost and token totals within each group
+
+Query usage via the local endpoints:
+
+```bash
+curl http://localhost:3128/llm-proxy/usage
+```
+
+A pretty HTML dashboard is also available while the proxy is running:
+
+```bash
+open http://localhost:3128/llm-proxy/usage/dashboard
+```
+
+Or via CLI:
+
+```bash
+llm-proxy usage
+llm-proxy usage --reset
+```
+
+The store path defaults to `~/.config/llm-proxy/usage.json` and can be overridden with the `usage_store_path` config option.
 
 ## Requirements
 
