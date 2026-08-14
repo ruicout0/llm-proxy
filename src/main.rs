@@ -974,6 +974,11 @@ async fn handle_request(
     let group = resolve_usage_group(&parts.headers);
     let body_bytes = to_bytes(body).await?;
 
+    // Extract request model for usage tracking fallback
+    let request_model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(|s| s.to_string()));
+
     // Always inject auth headers and forward to configured LLM host
     let bearer = token_cache.get_valid_bearer().await?;
     let x_api_key = token_cache.get_x_api_key().await?;
@@ -1062,8 +1067,9 @@ async fn handle_request(
                         let model = json["model"]
                             .as_str()
                             .or_else(|| json["model_id"].as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
+                            .map(|s| s.to_string())
+                            .or_else(|| request_model.clone())
+                            .unwrap_or_else(|| "unknown".to_string());
                         let cost = json["cost"]["total"]
                             .as_f64()
                             .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()));
