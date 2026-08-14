@@ -8,7 +8,7 @@ name = "llm-proxy"
 path = "src/main.rs"
 
 [dependencies]
-hyper = { version = "0.14", features = ["full", "client", "server"] }
+hyper = { version = "0.14", features = ["full"] }
 hyper-rustls = "0.24"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
 tracing = "0.1"
@@ -28,7 +28,7 @@ rustls-pemfile = "1.0"
 webpki-roots = "0.22"
 
 [profile.release]
-opt-level = "z"
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
