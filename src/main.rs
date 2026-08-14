@@ -23,16 +23,16 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
+use hyper::body::to_bytes;
+use hyper::client::HttpConnector;
+use hyper::server::Server;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::Client;
 use hyper::{
     header::{HeaderValue, AUTHORIZATION, CACHE_CONTROL},
-    Method, Request, Response, StatusCode, Body
+    Body, Method, Request, Response, StatusCode,
 };
-use hyper::service::{make_service_fn, service_fn};
-use hyper::server::Server;
-use hyper::client::HttpConnector;
-use rustls_pemfile;
 use hyper_rustls::HttpsConnector;
-use hyper::Client;
 use keyring::Entry;
 use plist::{Dictionary, Value as PlistValue};
 use serde::{Deserialize, Serialize};
@@ -42,7 +42,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use hyper::body::to_bytes;
 
 // No-op TLS certificate verifier for internal/self-signed certs
 struct NoopVerifier;
@@ -93,7 +92,9 @@ struct ConfigFile {
     insecure_skip_tls_verify: bool,
 }
 
-fn default_port() -> u16 { 3128 }
+fn default_port() -> u16 {
+    3128
+}
 
 impl ConfigFile {
     fn validate(&self) -> Result<()> {
@@ -119,7 +120,7 @@ struct Cli {
     /// Path to config file (default: ~/.config/llm-proxy/config.toml)
     #[arg(short = 'c', long, global = true)]
     config: Option<PathBuf>,
-    
+
     #[command(subcommand)]
     command: Command,
 }
@@ -203,7 +204,9 @@ impl Config {
     fn load(config_path: Option<PathBuf>, cli_args: Option<&InstallArgs>) -> Result<Self> {
         // Determine config file path
         let path = config_path.unwrap_or_else(|| {
-            home_dir().unwrap().join(".config/llm-proxy/config.toml")
+            home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".config/llm-proxy/config.toml")
         });
 
         // Load from file if exists
@@ -221,12 +224,24 @@ impl Config {
         // Apply CLI overrides if provided
         if let Some(args) = cli_args {
             if let Some(ref mut fc) = file_config {
-                if let Some(ref v) = args.host { fc.llm_host = v.clone(); }
-                if let Some(ref v) = args.api_key { fc.api_key = v.clone(); }
-                if let Some(ref v) = args.bearer_token { fc.bearer_token = Some(v.clone()); }
-                if let Some(ref v) = args.m2m_oauth_url { fc.token_endpoint = Some(v.clone()); }
-                if let Some(ref v) = args.client_id { fc.client_id = Some(v.clone()); }
-                if let Some(ref v) = args.client_secret { fc.client_secret = Some(v.clone()); }
+                if let Some(ref v) = args.host {
+                    fc.llm_host = v.clone();
+                }
+                if let Some(ref v) = args.api_key {
+                    fc.api_key = v.clone();
+                }
+                if let Some(ref v) = args.bearer_token {
+                    fc.bearer_token = Some(v.clone());
+                }
+                if let Some(ref v) = args.m2m_oauth_url {
+                    fc.token_endpoint = Some(v.clone());
+                }
+                if let Some(ref v) = args.client_id {
+                    fc.client_id = Some(v.clone());
+                }
+                if let Some(ref v) = args.client_secret {
+                    fc.client_secret = Some(v.clone());
+                }
                 fc.listen_port = args.port;
             } else {
                 // Create from CLI args only
@@ -245,38 +260,42 @@ impl Config {
                 file_config.as_ref().unwrap().validate()?;
             }
         } else if file_config.is_none() {
-            anyhow::bail!("Config file not found at: {}. Run 'llm-proxy install' or create it manually.", path.display());
+            anyhow::bail!(
+                "Config file not found at: {}. Run 'llm-proxy install' or create it manually.",
+                path.display()
+            );
         }
 
         let fc = file_config.unwrap();
-        
+
         // Try keychain for secrets first, fall back to config file values
         let x_api_key = Entry::new(KEYCHAIN_SERVICE, "x-api-key")
             .ok()
             .and_then(|e| e.get_password().ok())
             .unwrap_or(fc.api_key);
-        
+
         let bearer_token = fc.bearer_token.or_else(|| {
             Entry::new(KEYCHAIN_SERVICE, "bearer-token")
                 .ok()
                 .and_then(|e| e.get_password().ok())
         });
-        
+
         let client_secret = fc.client_secret.or_else(|| {
             Entry::new(KEYCHAIN_SERVICE, "client-secret")
                 .ok()
                 .and_then(|e| e.get_password().ok())
         });
-        
+
         // Validate that we have required secrets after keychain resolution
         if x_api_key.is_empty() {
             anyhow::bail!("api_key is required (set in config file or keychain)");
         }
-        let has_oauth = fc.token_endpoint.is_some() && fc.client_id.is_some() && client_secret.is_some();
+        let has_oauth =
+            fc.token_endpoint.is_some() && fc.client_id.is_some() && client_secret.is_some();
         if bearer_token.is_none() && !has_oauth {
             anyhow::bail!("Either bearer_token OR (m2m_oauth_url + client_id + client_secret) must be configured");
         }
-        
+
         Ok(Self {
             listen_port: fc.listen_port,
             llm_host: fc.llm_host,
@@ -296,17 +315,22 @@ impl Config {
 
 async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
     use dialoguer::{Confirm, Input, Select};
-    
+
     let path = config_path.unwrap_or_else(|| {
-        home_dir().unwrap().join(".config/llm-proxy/config.toml")
+        home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config/llm-proxy/config.toml")
     });
-    
+
     println!("\n🔧 llm-proxy Interactive Setup");
     println!("==============================\n");
-    
+
     if path.exists() {
         let overwrite = Confirm::new()
-            .with_prompt(format!("Config file already exists at {}. Overwrite?", path.display()))
+            .with_prompt(format!(
+                "Config file already exists at {}. Overwrite?",
+                path.display()
+            ))
             .default(false)
             .interact()?;
         if !overwrite {
@@ -314,29 +338,32 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
             return Ok(());
         }
     }
-    
+
     // Required fields
     let llm_host: String = Input::new()
         .with_prompt("Target LLM provider hostname (e.g., api.example.com)")
         .interact_text()?;
-    
+
     let api_key: String = Input::new()
         .with_prompt("X-API-Key value")
         .interact_text()?;
-    
+
     let listen_port: u16 = Input::new()
         .with_prompt("Listen port")
         .default(3128)
         .interact_text()?;
-    
+
     // Auth method
-    let auth_methods = &["M2M OAuth auto-refresh (recommended)", "Static bearer token"];
+    let auth_methods = &[
+        "M2M OAuth auto-refresh (recommended)",
+        "Static bearer token",
+    ];
     let auth_choice = Select::new()
         .with_prompt("Authentication method")
         .items(auth_methods)
         .default(0)
         .interact()?;
-    
+
     let mut config = ConfigFile {
         ca_cert_path: None,
         llm_host,
@@ -349,57 +376,59 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
         insecure_skip_tls_verify: false,
         bearer_token: None,
     };
-    
+
     if auth_choice == 0 {
         // M2M OAuth
         let token_endpoint: String = Input::new()
-            .with_prompt("M2M OAuth token endpoint URL (e.g., https://auth.example.com/oauth/token)")
+            .with_prompt(
+                "M2M OAuth token endpoint URL (e.g., https://auth.example.com/oauth/token)",
+            )
             .interact_text()?;
-        
+
         let client_id: String = Input::new()
             .with_prompt("OAuth Client ID")
             .interact_text()?;
-        
+
         let client_secret: String = Input::new()
             .with_prompt("OAuth Client Secret")
             .interact_text()?;
 
-                let scope: String = Input::new()
-                    .with_prompt("OAuth scope (optional, e.g., 'machine2machine' - leave empty to skip)")
-                    .allow_empty(true)
-                    .interact_text()?;
-                let scope = if scope.is_empty() { None } else { Some(scope) };
+        let scope: String = Input::new()
+            .with_prompt("OAuth scope (optional, e.g., 'machine2machine' - leave empty to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+        let scope = if scope.is_empty() { None } else { Some(scope) };
 
-                config.token_endpoint = Some(token_endpoint);
-                config.client_id = Some(client_id);
-                config.client_secret = Some(client_secret);
-                config.oauth_scope = scope;
+        config.token_endpoint = Some(token_endpoint);
+        config.client_id = Some(client_id);
+        config.client_secret = Some(client_secret);
+        config.oauth_scope = scope;
     } else {
         // Static bearer token
         let bearer_token: String = Input::new()
             .with_prompt("Static Bearer Token")
             .interact_text()?;
-        
+
         config.bearer_token = Some(bearer_token);
     }
-    
+
     // Validate
     config.validate()?;
-    
+
     // Create directory
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    
+
     // Write config file
     let toml_string = toml::to_string_pretty(&config)?;
     std::fs::write(&path, toml_string)?;
-    
+
     println!("\n✅ Config file created at: {}", path.display());
     println!("\nYou can now run:");
     println!("  llm-proxy run           # Run in foreground");
     println!("  llm-proxy install       # Install as service (uses config file)");
-    
+
     Ok(())
 }
 
@@ -430,7 +459,7 @@ impl TokenCache {
                     ta.name_constraints,
                 )
             }));
-            
+
             // Load custom CA certificate if provided
             if let Some(cert_path) = &config.ca_cert_path {
                 if let Ok(cert_data) = std::fs::read(cert_path) {
@@ -446,20 +475,23 @@ impl TokenCache {
                     warn!("Failed to read CA certificate from: {}", cert_path);
                 }
             }
-            
+
             rustls::ClientConfig::builder()
                 .with_safe_defaults()
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
-        
+
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_tls_config(client_config)
             .https_or_http()
             .enable_http1()
             .build();
-        
-        let client = Client::builder().build(https);
+
+        let client = Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(4)
+            .build(https);
         Self {
             bearer_token: RwLock::new(None),
             config,
@@ -468,7 +500,7 @@ impl TokenCache {
     }
 
     async fn get_valid_bearer(&self) -> Result<String> {
-        // Check cached token
+        // Fast path: read lock first
         {
             let guard = self.bearer_token.read().await;
             if let Some((token, expiry)) = &*guard {
@@ -478,12 +510,21 @@ impl TokenCache {
             }
         }
 
-        // Need refresh - either use static key or fetch new token
+        // Need refresh - check if static token configured
         if let Some(key) = &self.config.bearer_token {
             return Ok(key.clone());
         }
 
-        // Fetch from token endpoint
+        // Acquire write lock and double-check (only first contender refreshes)
+        let guard = self.bearer_token.write().await;
+        if let Some((token, expiry)) = &*guard {
+            if *expiry > Instant::now() + Duration::from_secs(60) {
+                return Ok(token.clone());
+            }
+        }
+
+        // Actually refresh the token
+        drop(guard);
         self.refresh_token().await
     }
 
@@ -492,12 +533,21 @@ impl TokenCache {
     }
 
     async fn refresh_token(&self) -> Result<String> {
-        let token_url = self.config.token_endpoint.as_ref()
+        let token_url = self
+            .config
+            .token_endpoint
+            .as_ref()
             .context("No token endpoint configured and no static bearer token")?;
-        
-        let client_id = self.config.client_id.as_ref()
+
+        let client_id = self
+            .config
+            .client_id
+            .as_ref()
             .context("client_id required for token refresh")?;
-        let client_secret = self.config.client_secret.as_ref()
+        let client_secret = self
+            .config
+            .client_secret
+            .as_ref()
             .context("client_secret required for token refresh")?;
 
         let form = if let Some(ref scope) = self.config.oauth_scope {
@@ -525,17 +575,22 @@ impl TokenCache {
         let resp = self.client.request(req).await?;
         let body = to_bytes(resp.into_body()).await?;
         let json: serde_json::Value = serde_json::from_slice(&body)?;
-        
-        let access_token = json["access_token"].as_str()
+
+        let access_token = json["access_token"]
+            .as_str()
             .context("No access_token in response")?
             .to_string();
         let expires_in = json["expires_in"].as_u64().unwrap_or(3600);
 
         let expiry = Instant::now() + Duration::from_secs(expires_in - 60); // Refresh 1 min early
         *self.bearer_token.write().await = Some((access_token.clone(), expiry));
-        
+
         info!("Refreshed LLM bearer token (expires in {}s)", expires_in);
         Ok(access_token)
+    }
+
+    async fn clear_token(&self) {
+        *self.bearer_token.write().await = None;
     }
 }
 
@@ -544,70 +599,82 @@ async fn handle_request(
     token_cache: Arc<TokenCache>,
     config: Arc<Config>,
 ) -> Result<Response<Body>> {
-    // Get path and query before consuming req
-    let path_and_query = req.uri().path_and_query()
+    // Capture method and path before consuming req
+    let method = req.method().clone();
+    let path_and_query = req
+        .uri()
+        .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/")
         .to_string();
-    
+
+    // Buffer the body so we can replay it on 401 retry
+    let (parts, body) = req.into_parts();
+    let body_bytes = to_bytes(body).await?;
+
     // Always inject auth headers and forward to configured LLM host
     let bearer = token_cache.get_valid_bearer().await?;
     let x_api_key = token_cache.get_x_api_key().await?;
-    
-    let (mut parts, body) = req.into_parts();
-    
-    // Rewrite URI to target the LLM host
-    let new_uri = format!("https://{}{}", config.llm_host, path_and_query);
-    parts.uri = new_uri.parse()?;
-    
-    // Inject auth headers
-    parts.headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {}", bearer))?
+
+    let uri: hyper::Uri = format!("https://{}{}", config.llm_host, path_and_query).parse()?;
+    let host_only = config
+        .llm_host
+        .split('/')
+        .next()
+        .unwrap_or(&config.llm_host);
+
+    // Build a fully-injected request from the buffered body
+    let build_request = |bearer: &str, api_key: &str| -> Result<Request<Body>> {
+        let mut req_builder = Request::builder().method(method.clone()).uri(uri.clone());
+
+        // Copy original headers except hop-by-hop and auth overrides
+        for (name, value) in parts.headers.iter() {
+            let lower = name.as_str().to_lowercase();
+            if lower == "host"
+                || lower == "authorization"
+                || lower == "x-apikey"
+                || lower == "transfer-encoding"
+                || lower == "connection"
+            {
+                continue;
+            }
+            req_builder = req_builder.header(name, value);
+        }
+
+        req_builder = req_builder
+            .header(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", bearer))?,
+            )
+            .header(
+                "x-apikey".parse::<hyper::header::HeaderName>()?,
+                HeaderValue::from_str(api_key)?,
+            )
+            .header(
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+            )
+            .header(hyper::header::HOST, HeaderValue::from_str(host_only)?);
+
+        Ok(req_builder.body(Body::from(body_bytes.clone()))?)
+    };
+
+    let request = build_request(&bearer, &x_api_key)?;
+    debug!(
+        "Forwarding {} {} to {}",
+        method, path_and_query, config.llm_host
     );
-    
-    parts.headers.insert(
-        "x-apikey".parse::<hyper::header::HeaderName>()?,
-        HeaderValue::from_str(&x_api_key)?
-    );
-    
-    parts.headers.insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("no-cache, no-store, must-revalidate")
-    );
-    
-    // Ensure Host header matches target (hostname only, no path)
-    let host_only = config.llm_host.split('/').next().unwrap_or(&config.llm_host);
-    parts.headers.insert(
-        hyper::header::HOST,
-        HeaderValue::from_str(host_only)?
-    );
-    
-    debug!("Forwarding to {} with auth headers", config.llm_host);
-    
-    let req = Request::from_parts(parts, body);
-    
-    match token_cache.client.request(req).await {
+
+    match token_cache.client.request(request).await {
         Ok(resp) => {
-            let status = resp.status();
-            
-            if status == StatusCode::UNAUTHORIZED {
+            if resp.status() == StatusCode::UNAUTHORIZED {
                 warn!("Got 401 from LLM - refreshing token and retrying once");
-                *token_cache.bearer_token.write().await = None;
-                
-                // Rebuild request with fresh token and retry
+                token_cache.clear_token().await;
+
                 let fresh_bearer = token_cache.get_valid_bearer().await?;
                 let x_api_key = token_cache.get_x_api_key().await?;
-                
-                let retry_req = Request::builder()
-                    .method(Method::GET)
-                    .uri(new_uri.clone())
-                    .header(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", fresh_bearer))?)
-                    .header("x-apikey".parse::<hyper::header::HeaderName>()?, HeaderValue::from_str(&x_api_key)?)
-                    .header(CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"))
-                    .header(hyper::header::HOST, HeaderValue::from_str(host_only)?)
-                    .body(Body::empty())?;
-                
+
+                let retry_req = build_request(&fresh_bearer, &x_api_key)?;
                 info!("Retrying request with fresh token");
                 match token_cache.client.request(retry_req).await {
                     Ok(retry_resp) => {
@@ -640,7 +707,9 @@ const KEYCHAIN_SERVICE: &str = "llm-proxy";
 
 fn plist_path() -> Result<PathBuf> {
     let home = home_dir().context("No home directory")?;
-    Ok(home.join("Library/LaunchAgents").join(format!("{}.plist", SERVICE_LABEL)))
+    Ok(home
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", SERVICE_LABEL)))
 }
 
 fn log_dir() -> Result<PathBuf> {
@@ -660,8 +729,9 @@ fn binary_path() -> Result<PathBuf> {
     }
 }
 
-fn config_path() -> PathBuf {
-    home_dir().unwrap().join(".config/llm-proxy/config.toml")
+fn config_path() -> Result<PathBuf> {
+    let home = home_dir().context("No home directory")?;
+    Ok(home.join(".config/llm-proxy/config.toml"))
 }
 
 async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Result<()> {
@@ -676,30 +746,45 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         if let Some(ref secret) = config.client_secret {
             Entry::new(KEYCHAIN_SERVICE, "client-secret")?.set_password(secret)?;
         }
-        info!("Stored secrets in macOS Keychain (service: {})", KEYCHAIN_SERVICE);
+        info!(
+            "Stored secrets in macOS Keychain (service: {})",
+            KEYCHAIN_SERVICE
+        );
     }
 
     // Write config file (without secrets if keychain is used)
-    let cfg_path = config_path();
+    let cfg_path = config_path()?;
     if let Some(config_dir) = cfg_path.parent() {
         std::fs::create_dir_all(config_dir)?;
     }
-    
+
     let config_file_content = ConfigFile {
         ca_cert_path: config.ca_cert_path.clone(),
         llm_host: config.llm_host.clone(),
         listen_port: config.listen_port,
-        api_key: if args.use_keychain { String::new() } else { config.x_api_key.clone() },
-        bearer_token: if args.use_keychain { None } else { config.bearer_token.clone() },
+        api_key: if args.use_keychain {
+            String::new()
+        } else {
+            config.x_api_key.clone()
+        },
+        bearer_token: if args.use_keychain {
+            None
+        } else {
+            config.bearer_token.clone()
+        },
         token_endpoint: config.token_endpoint.clone(),
         client_id: config.client_id.clone(),
-        client_secret: if args.use_keychain { None } else { config.client_secret.clone() },
+        client_secret: if args.use_keychain {
+            None
+        } else {
+            config.client_secret.clone()
+        },
         oauth_scope: config.oauth_scope.clone(),
         insecure_skip_tls_verify: config.insecure_skip_tls_verify,
     };
     let toml_str = toml::to_string_pretty(&config_file_content)?;
     std::fs::write(&cfg_path, toml_str)?;
-    info!("Wrote config file: {}", config_path().display());
+    info!("Wrote config file: {}", cfg_path.display());
 
     let bin_path = binary_path()?;
     let log_dir = log_dir()?;
@@ -708,21 +793,50 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
 
     // Build environment dict for launchd - only pass config path
     let mut env_dict = Dictionary::new();
-    env_dict.insert("LLM_PROXY_CONFIG".to_string(), PlistValue::String(config_path().to_string_lossy().to_string()));
-    env_dict.insert("RUST_LOG".to_string(), PlistValue::String("info".to_string()));
+    env_dict.insert(
+        "LLM_PROXY_CONFIG".to_string(),
+        PlistValue::String(config_path()?.to_string_lossy().to_string()),
+    );
+    env_dict.insert(
+        "RUST_LOG".to_string(),
+        PlistValue::String("info".to_string()),
+    );
 
     let mut plist = Dictionary::new();
-    plist.insert("Label".to_string(), PlistValue::String(SERVICE_LABEL.to_string()));
-    plist.insert("ProgramArguments".to_string(), PlistValue::Array(vec![
-        PlistValue::String(bin_path.to_string_lossy().to_string()),
-        PlistValue::String("run".to_string()),
-    ]));
+    plist.insert(
+        "Label".to_string(),
+        PlistValue::String(SERVICE_LABEL.to_string()),
+    );
+    plist.insert(
+        "ProgramArguments".to_string(),
+        PlistValue::Array(vec![
+            PlistValue::String(bin_path.to_string_lossy().to_string()),
+            PlistValue::String("run".to_string()),
+        ]),
+    );
     plist.insert("RunAtLoad".to_string(), PlistValue::Boolean(true));
     plist.insert("KeepAlive".to_string(), PlistValue::Boolean(true));
-    plist.insert("StandardOutPath".to_string(), PlistValue::String(out_log.to_string_lossy().to_string()));
-    plist.insert("StandardErrorPath".to_string(), PlistValue::String(err_log.to_string_lossy().to_string()));
-    plist.insert("EnvironmentVariables".to_string(), PlistValue::Dictionary(env_dict));
-    plist.insert("WorkingDirectory".to_string(), PlistValue::String(home_dir().ok_or_else(|| anyhow::anyhow!("No home directory"))?.to_string_lossy().to_string()));
+    plist.insert(
+        "StandardOutPath".to_string(),
+        PlistValue::String(out_log.to_string_lossy().to_string()),
+    );
+    plist.insert(
+        "StandardErrorPath".to_string(),
+        PlistValue::String(err_log.to_string_lossy().to_string()),
+    );
+    plist.insert(
+        "EnvironmentVariables".to_string(),
+        PlistValue::Dictionary(env_dict),
+    );
+    plist.insert(
+        "WorkingDirectory".to_string(),
+        PlistValue::String(
+            home_dir()
+                .ok_or_else(|| anyhow::anyhow!("No home directory"))?
+                .to_string_lossy()
+                .to_string(),
+        ),
+    );
 
     let path = plist_path()?;
     if let Some(parent) = path.parent() {
@@ -731,7 +845,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
     plist::Value::Dictionary(plist).to_file_xml(&path)?;
 
     info!("Installed launchd service: {}", path.display());
-    info!("Config: {}", config_path().display());
+    info!("Config: {}", cfg_path.display());
     info!("Logs: {}", log_dir.display());
     info!("Run 'llm-proxy start' to start the service");
     Ok(())
@@ -785,11 +899,11 @@ fn logs_service() -> Result<()> {
     let log_dir = log_dir()?;
     let out_log = log_dir.join("stdout.log");
     let err_log = log_dir.join("stderr.log");
-    
+
     println!("Following logs (Ctrl+C to stop)...");
     println!("  stdout: {}", out_log.display());
     println!("  stderr: {}", err_log.display());
-    
+
     let mut child = std::process::Command::new("tail")
         .args(["-f", out_log.to_str().unwrap(), err_log.to_str().unwrap()])
         .spawn()?;
@@ -804,14 +918,14 @@ fn uninstall_service() -> Result<()> {
         std::fs::remove_file(&path)?;
         info!("Removed plist: {}", path.display());
     }
-    
+
     // Remove config file
-    let cfg_path = config_path();
+    let cfg_path = config_path()?;
     if cfg_path.exists() {
         std::fs::remove_file(&cfg_path)?;
         info!("Removed config: {}", cfg_path.display());
     }
-    
+
     // Remove keychain entries (best effort)
     for account in ["x-api-key", "bearer-token", "client-secret"] {
         if let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, account) {
@@ -819,7 +933,7 @@ fn uninstall_service() -> Result<()> {
         }
     }
     info!("Removed keychain entries");
-    
+
     info!("Service uninstalled");
     Ok(())
 }
@@ -852,9 +966,9 @@ async fn main() -> Result<()> {
 
 async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     let config = Arc::new(Config::load(config_file, None)?);
-    
+
     let token_cache = Arc::new(TokenCache::new(config.clone()));
-    
+
     let addr = SocketAddr::from(([127, 0, 0, 1], config.listen_port));
     info!("LLM proxy listening on {}", addr);
     info!("Target LLM host: {}", config.llm_host);
@@ -871,6 +985,200 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
         }
     });
 
-    Server::bind(&addr).serve(make_svc).await?;
+    let server = Server::bind(&addr).serve(make_svc);
+    info!("Server started, waiting for shutdown signal...");
+    server.with_graceful_shutdown(shutdown_signal()).await?;
+    info!("Shutdown complete");
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received SIGINT, shutting down gracefully...");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM, shutting down gracefully...");
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_file_parses_valid_toml() {
+        let content = r#"
+llm_host = "api.example.com"
+api_key = "test-key-123"
+bearer_token = "static-token-abc"
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.llm_host, "api.example.com");
+        assert_eq!(cfg.listen_port, 3128);
+        assert_eq!(cfg.api_key, "test-key-123");
+        assert_eq!(cfg.bearer_token, Some("static-token-abc".to_string()));
+    }
+
+    #[test]
+    fn config_file_parses_oauth_fields() {
+        let content = r#"
+llm_host = "api.example.com"
+api_key = "key"
+m2m_oauth_url = "https://auth.example.com/oauth/token"
+client_id = "my-client"
+client_secret = "my-secret"
+oauth_scope = "machine2machine"
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.token_endpoint,
+            Some("https://auth.example.com/oauth/token".to_string())
+        );
+        assert_eq!(cfg.client_id, Some("my-client".to_string()));
+        assert_eq!(cfg.oauth_scope, Some("machine2machine".to_string()));
+    }
+
+    #[test]
+    fn config_file_fails_without_auth() {
+        let content = r#"
+llm_host = "api.example.com"
+api_key = "key"
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_file_fails_without_host() {
+        let content = r#"
+llm_host = ""
+api_key = "key"
+bearer_token = "token"
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_file_default_values() {
+        let content = r#"
+llm_host = "api.example.com"
+api_key = "key"
+bearer_token = "token"
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        assert_eq!(cfg.listen_port, 3128);
+        assert!(cfg.token_endpoint.is_none());
+        assert!(cfg.ca_cert_path.is_none());
+        assert!(!cfg.insecure_skip_tls_verify);
+    }
+
+    #[test]
+    fn token_cache_uses_static_bearer() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let config = Arc::new(Config {
+                listen_port: 3128,
+                llm_host: "api.example.com".into(),
+                bearer_token: Some("static-token".into()),
+                x_api_key: "key".into(),
+                token_endpoint: None,
+                client_id: None,
+                client_secret: None,
+                oauth_scope: None,
+                ca_cert_path: None,
+                insecure_skip_tls_verify: false,
+            });
+            let cache = TokenCache::new(config);
+            let token = cache.get_valid_bearer().await.unwrap();
+            assert_eq!(token, "static-token");
+        });
+    }
+
+    #[test]
+    fn token_cache_clear_and_repopulate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let config = Arc::new(Config {
+                listen_port: 3128,
+                llm_host: "api.example.com".into(),
+                bearer_token: Some("static-token".into()),
+                x_api_key: "key".into(),
+                token_endpoint: None,
+                client_id: None,
+                client_secret: None,
+                oauth_scope: None,
+                ca_cert_path: None,
+                insecure_skip_tls_verify: false,
+            });
+            let cache = TokenCache::new(config);
+            // First call populates
+            let _ = cache.get_valid_bearer().await.unwrap();
+            // Clear the cached token
+            cache.clear_token().await;
+            // Should still get static token
+            let token = cache.get_valid_bearer().await.unwrap();
+            assert_eq!(token, "static-token");
+        });
+    }
+
+    #[test]
+    fn token_cache_returns_x_api_key() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let config = Arc::new(Config {
+                listen_port: 3128,
+                llm_host: "api.example.com".into(),
+                bearer_token: Some("token".into()),
+                x_api_key: "my-api-key".into(),
+                token_endpoint: None,
+                client_id: None,
+                client_secret: None,
+                oauth_scope: None,
+                ca_cert_path: None,
+                insecure_skip_tls_verify: false,
+            });
+            let cache = TokenCache::new(config);
+            let key = cache.get_x_api_key().await.unwrap();
+            assert_eq!(key, "my-api-key");
+        });
+    }
+
+    #[test]
+    fn config_file_with_insecure_tls() {
+        let content = r#"
+llm_host = "api.example.com"
+api_key = "key"
+bearer_token = "token"
+insecure_skip_tls_verify = true
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.insecure_skip_tls_verify);
+    }
 }
