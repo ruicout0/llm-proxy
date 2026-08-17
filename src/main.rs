@@ -1,133 +1,34 @@
-//! llm-proxy - Lightweight proxy for gh copilot with auth header injection and OAuth token refresh
-//!
-//! Usage:
-//!   llm-proxy run                    # Run in foreground (reads from config file)
-//!   llm-proxy install [OPTIONS]      # Install as macOS launchd service
-//!   llm-proxy start                  # Start service
-//!   llm-proxy stop                   # Stop service
-//!   llm-proxy restart                # Restart service
-//!   llm-proxy status                 # Show service status
-//!   llm-proxy logs                   # Follow service logs
-//!   llm-proxy uninstall              # Remove service
-//!
-//! Config file (TOML):
-//!   # ~/.config/llm-proxy/config.toml
-//!   llm_host = "api.your-llm-provider.com"
-//!   listen_port = 3128
-//!   api_key = "your-x-api-key"
-//!   m2m_oauth_url = "https://auth.example.com/oauth/token"
-//!   client_id = "your-client-id"
-//!   client_secret = "your-client-secret"
-//!   # bearer_token = "static-token"  # Optional: use instead of OAuth
+//! llm-proxy - Multi-Provider LLM Proxy with auth header injection, usage tracking, and model discovery.
+
+pub mod config;
+pub mod discovery;
+pub mod provider;
+pub mod proxy;
+pub mod router;
+pub mod usage;
 
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
-use futures_util::{stream, StreamExt};
-use hyper::body::to_bytes;
-use hyper::client::HttpConnector;
 use hyper::server::Server;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::Client;
-use hyper::{
-    header::{HeaderValue, AUTHORIZATION, CACHE_CONTROL},
-    Body, Method, Request, Response, StatusCode,
-};
-use hyper_rustls::HttpsConnector;
 use keyring::Entry;
 use plist::{Dictionary, Value as PlistValue};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use std::time::Duration;
+use tracing::{info, warn};
 
-// No-op TLS certificate verifier for internal/self-signed certs
-struct NoopVerifier;
-impl rustls::client::ServerCertVerifier for NoopVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
-    }
-}
-
-// ============================================================================
-// Config File
-// ============================================================================
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct ConfigFile {
-    /// Target LLM provider hostname (required)
-    llm_host: String,
-    /// Port to listen on (default: 3128)
-    #[serde(default = "default_port")]
-    listen_port: u16,
-    /// X-API-Key header value (required)
-    api_key: String,
-    /// M2M OAuth token endpoint URL (for auto-refresh)
-    #[serde(rename = "m2m_oauth_url")]
-    token_endpoint: Option<String>,
-    /// OAuth client ID
-    client_id: Option<String>,
-    /// OAuth client secret
-    client_secret: Option<String>,
-    /// OAuth scope (e.g., "machine2machine")
-    #[serde(default)]
-    oauth_scope: Option<String>,
-    /// Static bearer token (alternative to OAuth)
-    bearer_token: Option<String>,
-    /// Optional CA certificate path (PEM format) for custom TLS verification
-    #[serde(default)]
-    ca_cert_path: Option<String>,
-    /// Skip TLS certificate verification for upstream LLM host
-    #[serde(default)]
-    insecure_skip_tls_verify: bool,
-    /// Path to usage/cost tracking JSON store
-    #[serde(default)]
-    usage_store_path: Option<String>,
-}
-
-fn default_port() -> u16 {
-    3128
-}
-
-fn default_usage_store_path() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/llm-proxy/usage.json")
-}
-
-impl ConfigFile {
-    fn validate(&self) -> Result<()> {
-        if self.llm_host.is_empty() {
-            anyhow::bail!("llm_host is required in config file");
-        }
-        // api_key can be empty in file if stored in keychain
-        let has_oauth = self.token_endpoint.is_some() && self.client_id.is_some();
-        if self.bearer_token.is_none() && !has_oauth {
-            anyhow::bail!("Either bearer_token OR (m2m_oauth_url + client_id) must be provided. client_secret and api_key may be stored in keychain.");
-        }
-        Ok(())
-    }
-}
-
-// ============================================================================
-// CLI
-// ============================================================================
+use crate::config::{default_usage_store_path, ConfigFile, ProviderConfig};
+use crate::discovery::DiscoveryCache;
+use crate::provider::KEYCHAIN_SERVICE;
+use crate::proxy::handle_request;
+use crate::router::Registry;
+use crate::usage::UsageStore;
 
 #[derive(Parser)]
-#[command(name = "llm-proxy", version, about = "LLM proxy with auth injection")]
+#[command(name = "llm-proxy", version, about = "Lightweight multi-provider LLM proxy with OAuth token refresh and usage tracking")]
 struct Cli {
     /// Path to config file (default: ~/.config/llm-proxy/config.toml)
     #[arg(short = 'c', long, global = true)]
@@ -157,8 +58,31 @@ enum Command {
     Logs,
     /// Show accumulated usage/cost totals
     Usage(UsageArgs),
+    /// List configured providers
+    Providers(ProvidersArgs),
+    /// Migrate keychain accounts to <provider>:<secret>
+    MigrateKeychain(MigrateKeychainArgs),
     /// Uninstall the service
     Uninstall,
+}
+
+#[derive(Parser)]
+struct ProvidersArgs {
+    #[command(subcommand)]
+    subcmd: Option<ProvidersSubcommand>,
+}
+
+#[derive(Subcommand)]
+enum ProvidersSubcommand {
+    /// List all configured providers
+    List,
+}
+
+#[derive(Parser)]
+struct MigrateKeychainArgs {
+    /// Preview migrations without modifying Keychain
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Parser)]
@@ -167,12 +91,20 @@ struct UsageArgs {
     #[arg(short = 'p', long)]
     store_path: Option<PathBuf>,
 
+    /// Filter by provider ID
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Show detailed provider breakdown
+    #[arg(long)]
+    by_provider: bool,
+
     /// Reset all usage data
     #[arg(long)]
     reset: bool,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 struct InstallArgs {
     /// Target LLM provider hostname
     #[arg(short = 'h', long)]
@@ -208,1147 +140,10 @@ struct InstallArgs {
 }
 
 // ============================================================================
-// Runtime Config
+// Runtime & Service Helpers
 // ============================================================================
 
-struct Config {
-    listen_port: u16,
-    llm_host: String,
-    bearer_token: Option<String>,
-    x_api_key: String,
-    token_endpoint: Option<String>,
-    client_id: Option<String>,
-    client_secret: Option<String>,
-    oauth_scope: Option<String>,
-    ca_cert_path: Option<String>,
-    insecure_skip_tls_verify: bool,
-    usage_store_path: PathBuf,
-}
-
-impl Config {
-    /// Load config from file, with CLI args as override
-    fn load(config_path: Option<PathBuf>, cli_args: Option<&InstallArgs>) -> Result<Self> {
-        // Determine config file path
-        let path = config_path.unwrap_or_else(|| {
-            home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".config/llm-proxy/config.toml")
-        });
-
-        // Load from file if exists
-        let mut file_config = if path.exists() {
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read config file: {}", path.display()))?;
-            let cfg: ConfigFile = toml::from_str(&content)
-                .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
-            cfg.validate()?;
-            Some(cfg)
-        } else {
-            None
-        };
-
-        // Apply CLI overrides if provided
-        if let Some(args) = cli_args {
-            if let Some(ref mut fc) = file_config {
-                if let Some(ref v) = args.host {
-                    fc.llm_host = v.clone();
-                }
-                if let Some(ref v) = args.api_key {
-                    fc.api_key = v.clone();
-                }
-                if let Some(ref v) = args.bearer_token {
-                    fc.bearer_token = Some(v.clone());
-                }
-                if let Some(ref v) = args.m2m_oauth_url {
-                    fc.token_endpoint = Some(v.clone());
-                }
-                if let Some(ref v) = args.client_id {
-                    fc.client_id = Some(v.clone());
-                }
-                if let Some(ref v) = args.client_secret {
-                    fc.client_secret = Some(v.clone());
-                }
-                fc.listen_port = args.port;
-            } else {
-                // Create from CLI args only
-                file_config = Some(ConfigFile {
-                    llm_host: args.host.clone().context("host required")?,
-                    api_key: args.api_key.clone().context("api_key required")?,
-                    bearer_token: args.bearer_token.clone(),
-                    token_endpoint: args.m2m_oauth_url.clone(),
-                    client_id: args.client_id.clone(),
-                    client_secret: args.client_secret.clone(),
-                    listen_port: args.port,
-                    ca_cert_path: None,
-                    oauth_scope: None,
-                    insecure_skip_tls_verify: false,
-                    usage_store_path: None,
-                });
-                file_config.as_ref().unwrap().validate()?;
-            }
-        } else if file_config.is_none() {
-            anyhow::bail!(
-                "Config file not found at: {}. Run 'llm-proxy install' or create it manually.",
-                path.display()
-            );
-        }
-
-        let fc = file_config.unwrap();
-
-        // Try keychain for secrets first, fall back to config file values
-        let x_api_key = Entry::new(KEYCHAIN_SERVICE, "x-api-key")
-            .ok()
-            .and_then(|e| e.get_password().ok())
-            .unwrap_or(fc.api_key);
-
-        let bearer_token = fc.bearer_token.or_else(|| {
-            Entry::new(KEYCHAIN_SERVICE, "bearer-token")
-                .ok()
-                .and_then(|e| e.get_password().ok())
-        });
-
-        let client_secret = fc.client_secret.or_else(|| {
-            Entry::new(KEYCHAIN_SERVICE, "client-secret")
-                .ok()
-                .and_then(|e| e.get_password().ok())
-        });
-
-        // Validate that we have required secrets after keychain resolution
-        if x_api_key.is_empty() {
-            anyhow::bail!("api_key is required (set in config file or keychain)");
-        }
-        let has_oauth =
-            fc.token_endpoint.is_some() && fc.client_id.is_some() && client_secret.is_some();
-        if bearer_token.is_none() && !has_oauth {
-            anyhow::bail!("Either bearer_token OR (m2m_oauth_url + client_id + client_secret) must be configured");
-        }
-
-        Ok(Self {
-            listen_port: fc.listen_port,
-            llm_host: fc.llm_host,
-            bearer_token,
-            x_api_key,
-            token_endpoint: fc.token_endpoint,
-            client_id: fc.client_id,
-            client_secret,
-            oauth_scope: fc.oauth_scope,
-            ca_cert_path: fc.ca_cert_path,
-            insecure_skip_tls_verify: fc.insecure_skip_tls_verify,
-            usage_store_path: fc
-                .usage_store_path
-                .map(PathBuf::from)
-                .unwrap_or_else(default_usage_store_path),
-        })
-    }
-}
-// Interactive Setup
-// ============================================================================
-
-async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
-    use dialoguer::{Confirm, Input, Select};
-
-    let path = config_path.unwrap_or_else(|| {
-        home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".config/llm-proxy/config.toml")
-    });
-
-    println!("\n🔧 llm-proxy Interactive Setup");
-    println!("==============================\n");
-
-    if path.exists() {
-        let overwrite = Confirm::new()
-            .with_prompt(format!(
-                "Config file already exists at {}. Overwrite?",
-                path.display()
-            ))
-            .default(false)
-            .interact()?;
-        if !overwrite {
-            println!("Setup cancelled.");
-            return Ok(());
-        }
-    }
-
-    // Required fields
-    let llm_host: String = Input::new()
-        .with_prompt("Target LLM provider hostname (e.g., api.example.com)")
-        .interact_text()?;
-
-    let api_key: String = Input::new()
-        .with_prompt("X-API-Key value")
-        .interact_text()?;
-
-    let listen_port: u16 = Input::new()
-        .with_prompt("Listen port")
-        .default(3128)
-        .interact_text()?;
-
-    // Auth method
-    let auth_methods = &[
-        "M2M OAuth auto-refresh (recommended)",
-        "Static bearer token",
-    ];
-    let auth_choice = Select::new()
-        .with_prompt("Authentication method")
-        .items(auth_methods)
-        .default(0)
-        .interact()?;
-
-    let mut config = ConfigFile {
-        ca_cert_path: None,
-        llm_host,
-        api_key,
-        listen_port,
-        token_endpoint: None,
-        client_id: None,
-        client_secret: None,
-        oauth_scope: None,
-        insecure_skip_tls_verify: false,
-        bearer_token: None,
-        usage_store_path: None,
-    };
-
-    if auth_choice == 0 {
-        // M2M OAuth
-        let token_endpoint: String = Input::new()
-            .with_prompt(
-                "M2M OAuth token endpoint URL (e.g., https://auth.example.com/oauth/token)",
-            )
-            .interact_text()?;
-
-        let client_id: String = Input::new()
-            .with_prompt("OAuth Client ID")
-            .interact_text()?;
-
-        let client_secret: String = Input::new()
-            .with_prompt("OAuth Client Secret")
-            .interact_text()?;
-
-        let scope: String = Input::new()
-            .with_prompt("OAuth scope (optional, e.g., 'machine2machine' - leave empty to skip)")
-            .allow_empty(true)
-            .interact_text()?;
-        let scope = if scope.is_empty() { None } else { Some(scope) };
-
-        config.token_endpoint = Some(token_endpoint);
-        config.client_id = Some(client_id);
-        config.client_secret = Some(client_secret);
-        config.oauth_scope = scope;
-    } else {
-        // Static bearer token
-        let bearer_token: String = Input::new()
-            .with_prompt("Static Bearer Token")
-            .interact_text()?;
-
-        config.bearer_token = Some(bearer_token);
-    }
-
-    // Validate
-    config.validate()?;
-
-    // Create directory
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Write config file
-    let toml_string = toml::to_string_pretty(&config)?;
-    std::fs::write(&path, toml_string)?;
-
-    println!("\n✅ Config file created at: {}", path.display());
-    println!("\nYou can now run:");
-    println!("  llm-proxy run           # Run in foreground");
-    println!("  llm-proxy install       # Install as service (uses config file)");
-
-    Ok(())
-}
-
-// ============================================================================
-// Usage Tracking
-// ============================================================================
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
-struct ModelUsage {
-    requests: u64,
-    #[serde(default)]
-    cost: BTreeMap<String, f64>,
-    #[serde(default)]
-    tokens: BTreeMap<String, u64>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
-struct GroupUsage {
-    requests: u64,
-    #[serde(default)]
-    models: BTreeMap<String, ModelUsage>,
-    #[serde(default)]
-    totals: BTreeMap<String, f64>,
-}
-
-#[derive(Debug, Default, Clone, Deserialize, Serialize, PartialEq)]
-struct UsageStoreData {
-    #[serde(default)]
-    groups: BTreeMap<String, GroupUsage>,
-    #[serde(default)]
-    global_requests: u64,
-    #[serde(default)]
-    global_totals: BTreeMap<String, f64>,
-    last_updated: Option<u64>,
-}
-
-impl UsageStoreData {
-    fn touch_last_updated(&mut self) {
-        self.last_updated = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .ok()
-            .map(|d| d.as_secs());
-    }
-}
-
-struct UsageStore {
-    data: RwLock<UsageStoreData>,
-    path: PathBuf,
-}
-
-impl UsageStore {
-    fn new(path: PathBuf) -> Self {
-        let data = if path.exists() {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<UsageStoreData>(&s).ok())
-                .unwrap_or_default()
-        } else {
-            UsageStoreData::default()
-        };
-        Self {
-            data: RwLock::new(data),
-            path,
-        }
-    }
-
-    async fn record(
-        &self,
-        group: &str,
-        model: &str,
-        cost: Option<(f64, String)>,
-        tokens: BTreeMap<String, u64>,
-    ) -> Result<()> {
-        let mut data = self.data.write().await;
-        data.global_requests += 1;
-
-        let group = data.groups.entry(group.to_string()).or_default();
-        group.requests += 1;
-
-        let model_usage = group.models.entry(model.to_string()).or_default();
-        model_usage.requests += 1;
-
-        if let Some((amount, currency)) = cost {
-            if amount > 0.0 {
-                *model_usage.cost.entry(currency.clone()).or_default() += amount;
-                *group.totals.entry(currency.clone()).or_default() += amount;
-            }
-        }
-
-        for (token_type, count) in tokens {
-            if count > 0 {
-                *model_usage.tokens.entry(token_type.clone()).or_default() += count;
-                *group
-                    .totals
-                    .entry(format!("{}_tokens", token_type))
-                    .or_default() += count as f64;
-            }
-        }
-
-        // Recalculate global totals from groups to avoid multiple mutable borrows
-        let mut global_totals = BTreeMap::new();
-        for group in data.groups.values() {
-            for (currency, amount) in &group.totals {
-                *global_totals.entry(currency.clone()).or_default() += amount;
-            }
-        }
-        data.global_totals = global_totals;
-
-        data.touch_last_updated();
-        self.persist_sync(&data)?;
-        Ok(())
-    }
-
-    async fn get(&self) -> UsageStoreData {
-        self.data.read().await.clone()
-    }
-
-    async fn reset(&self) -> Result<()> {
-        let mut data = self.data.write().await;
-        *data = UsageStoreData::default();
-        data.touch_last_updated();
-        self.persist_sync(&data)?;
-        Ok(())
-    }
-
-    fn persist_sync(&self, data: &UsageStoreData) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("Failed to create usage store dir: {}", parent.display())
-            })?;
-        }
-        let json = serde_json::to_string_pretty(data)?;
-        std::fs::write(&self.path, json)
-            .with_context(|| format!("Failed to write usage store: {}", self.path.display()))?;
-        Ok(())
-    }
-}
-
-fn resolve_usage_group(headers: &hyper::HeaderMap) -> String {
-    if let Some(value) = headers.get("x-usage-group").and_then(|v| v.to_str().ok()) {
-        if !value.is_empty() {
-            return value.to_string();
-        }
-    }
-
-    if let Some(value) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        let normalized = value.trim().to_lowercase();
-        if !normalized.is_empty() {
-            return format!("auth:{}", sha256_hex(normalized.as_bytes()));
-        }
-    }
-
-    if let Some(value) = headers.get("x-apikey").and_then(|v| v.to_str().ok()) {
-        if !value.is_empty() {
-            return format!("apikey:{}", sha256_hex(value.as_bytes()));
-        }
-    }
-
-    "default".to_string()
-}
-
-fn sha256_hex(input: &[u8]) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-fn usage_dashboard_html() -> &'static str {
-    r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LLM Proxy Usage</title>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --panel: #1e293b;
-      --panel-2: #27354f;
-      --text: #e2e8f0;
-      --muted: #94a3b8;
-      --accent: #38bdf8;
-      --accent-2: #818cf8;
-      --success: #34d399;
-      --danger: #f87171;
-      --border: #334155;
-      --radius: 14px;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      line-height: 1.5;
-    }
-    .container { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
-    header { margin-bottom: 28px; }
-    h1 { margin: 0 0 6px; font-size: 1.75rem; letter-spacing: -0.02em; }
-    .subtitle { color: var(--muted); font-size: 0.95rem; }
-    .refresh { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
-    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin-bottom: 28px; }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 20px;
-      box-shadow: 0 4px 20px rgba(0,0,0,0.25);
-    }
-    .card h3 { margin: 0 0 6px; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
-    .card .value { font-size: 1.7rem; font-weight: 700; color: var(--text); }
-    .card .value.accent { color: var(--accent); }
-    .card .value.success { color: var(--success); }
-    .card .value.danger { color: var(--danger); }
-    section { margin-bottom: 28px; }
-    h2 { font-size: 1.15rem; margin: 0 0 14px; display: flex; align-items: center; gap: 8px; }
-    table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-    th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
-    th { background: var(--panel-2); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
-    tr:last-child td { border-bottom: none; }
-    tr:hover td { background: rgba(255,255,255,0.03); }
-    .tag { display: inline-block; padding: 3px 8px; border-radius: 999px; background: var(--panel-2); font-size: 0.75rem; color: var(--accent); border: 1px solid var(--border); }
-    .empty { color: var(--muted); font-style: italic; padding: 20px; text-align: center; }
-    .right { text-align: right; }
-    .last-updated { color: var(--muted); font-size: 0.8rem; margin-top: 12px; }
-    @media (max-width: 600px) {
-      .container { padding: 20px 14px; }
-      th, td { padding: 10px 12px; font-size: 0.85rem; }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <header>
-      <h1>🧠 LLM Proxy Usage</h1>
-      <div class="subtitle">Live cost and token totals from proxied requests</div>
-      <div class="refresh">Auto-refresh every 30s · <a href="/llm-proxy/usage" style="color:var(--accent)">JSON API</a></div>
-    </header>
-
-    <div class="grid" id="summary">
-      <div class="card"><h3>Total Requests</h3><div class="value accent" id="total-requests">–</div></div>
-      <div class="card"><h3>Total Cost</h3><div class="value success" id="total-cost">–</div></div>
-      <div class="card"><h3>Active Groups</h3><div class="value" id="active-groups">–</div></div>
-      <div class="card"><h3>Models Used</h3><div class="value" id="models-used">–</div></div>
-    </div>
-
-    <section>
-      <h2>📊 Per-Group / Per-Model</h2>
-      <table id="details-table">
-        <thead>
-          <tr><th>Group</th><th>Model</th><th class="right">Requests</th><th class="right">Cost</th><th class="right">Tokens</th></tr>
-        </thead>
-        <tbody id="details-body"><tr><td colspan="5" class="empty">No usage recorded yet.</td></tr></tbody>
-      </table>
-      <div class="last-updated" id="last-updated"></div>
-    </section>
-  </div>
-
-  <script>
-    const fmt = (n) => typeof n === 'number' ? n.toLocaleString() : '–';
-    const fmtCost = (n, c) => typeof n === 'number' ? `${n.toFixed(6)} ${c || 'USD'}` : '–';
-
-    async function load() {
-      try {
-        const res = await fetch('/llm-proxy/usage');
-        const data = await res.json();
-
-        document.getElementById('total-requests').textContent = fmt(data.global_requests);
-
-        const costEntries = Object.entries(data.global_totals || {}).filter(([k]) => !k.endsWith('_tokens'));
-        document.getElementById('total-cost').textContent = costEntries.length
-          ? costEntries.map(([c, a]) => fmtCost(a, c)).join(' + ')
-          : '$0.000000';
-
-        const groups = Object.entries(data.groups || {});
-        document.getElementById('active-groups').textContent = groups.length;
-
-        let modelCount = 0;
-        const tbody = document.getElementById('details-body');
-        tbody.innerHTML = '';
-
-        if (groups.length === 0) {
-          tbody.innerHTML = '<tr><td colspan="5" class="empty">No usage recorded yet.</td></tr>';
-        } else {
-          for (const [groupName, group] of groups) {
-            const models = Object.entries(group.models || {});
-            modelCount += models.length;
-            for (const [modelName, model] of models) {
-              const cost = Object.entries(model.cost || {})
-                .filter(([k]) => !k.endsWith('_tokens'))
-                .map(([c, a]) => fmtCost(a, c))
-                .join(' + ') || '–';
-              const tokens = Object.entries(model.tokens || {})
-                .map(([t, n]) => `${t}: ${fmt(n)}`)
-                .join('<br>') || '–';
-              const row = document.createElement('tr');
-              row.innerHTML = `<td><span class="tag">${groupName}</span></td><td>${modelName}</td><td class="right">${fmt(model.requests)}</td><td class="right">${cost}</td><td class="right">${tokens}</td>`;
-              tbody.appendChild(row);
-            }
-          }
-        }
-        document.getElementById('models-used').textContent = modelCount;
-
-        const ts = data.last_updated
-          ? new Date(data.last_updated * 1000).toLocaleString()
-          : 'never';
-        document.getElementById('last-updated').textContent = 'Last updated: ' + ts;
-      } catch (e) {
-        console.error(e);
-      }
-    }
-
-    load();
-    setInterval(load, 30000);
-  </script>
-</body>
-</html>"##
-}
-
-// ============================================================================
-// Token Cache
-// ============================================================================
-
-struct TokenCache {
-    bearer_token: RwLock<Option<(String, Instant)>>,
-    config: Arc<Config>,
-    client: Client<HttpsConnector<HttpConnector>>,
-}
-
-impl TokenCache {
-    fn new(config: Arc<Config>) -> Self {
-        let client_config = if config.insecure_skip_tls_verify {
-            info!("WARNING: TLS certificate verification disabled for upstream connections");
-            rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_custom_certificate_verifier(Arc::new(NoopVerifier))
-                .with_no_client_auth()
-        } else {
-            let mut root_store = rustls::RootCertStore::empty();
-            root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-                rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                    ta.subject,
-                    ta.spki,
-                    ta.name_constraints,
-                )
-            }));
-
-            // Load custom CA certificate if provided
-            if let Some(cert_path) = &config.ca_cert_path {
-                if let Ok(cert_data) = std::fs::read(cert_path) {
-                    if let Ok(certs) = rustls_pemfile::certs(&mut &cert_data[..]) {
-                        for cert in certs {
-                            root_store.add(&rustls::Certificate(cert)).ok();
-                        }
-                        info!("Loaded custom CA certificate from: {}", cert_path);
-                    } else {
-                        warn!("Failed to parse CA certificate from: {}", cert_path);
-                    }
-                } else {
-                    warn!("Failed to read CA certificate from: {}", cert_path);
-                }
-            }
-
-            rustls::ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
-
-        let https = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_tls_config(client_config)
-            .https_or_http()
-            .enable_http1()
-            .build();
-
-        let client = Client::builder()
-            .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(4)
-            .build(https);
-        Self {
-            bearer_token: RwLock::new(None),
-            config,
-            client,
-        }
-    }
-
-    async fn get_valid_bearer(&self) -> Result<String> {
-        // Fast path: read lock first
-        {
-            let guard = self.bearer_token.read().await;
-            if let Some((token, expiry)) = &*guard {
-                if *expiry > Instant::now() + Duration::from_secs(60) {
-                    return Ok(token.clone());
-                }
-            }
-        }
-
-        // Need refresh - check if static token configured
-        if let Some(key) = &self.config.bearer_token {
-            return Ok(key.clone());
-        }
-
-        // Acquire write lock and double-check (only first contender refreshes)
-        let guard = self.bearer_token.write().await;
-        if let Some((token, expiry)) = &*guard {
-            if *expiry > Instant::now() + Duration::from_secs(60) {
-                return Ok(token.clone());
-            }
-        }
-
-        // Actually refresh the token
-        drop(guard);
-        self.refresh_token().await
-    }
-
-    async fn get_x_api_key(&self) -> Result<String> {
-        Ok(self.config.x_api_key.clone())
-    }
-
-    async fn refresh_token(&self) -> Result<String> {
-        let token_url = self
-            .config
-            .token_endpoint
-            .as_ref()
-            .context("No token endpoint configured and no static bearer token")?;
-
-        let client_id = self
-            .config
-            .client_id
-            .as_ref()
-            .context("client_id required for token refresh")?;
-        let client_secret = self
-            .config
-            .client_secret
-            .as_ref()
-            .context("client_secret required for token refresh")?;
-
-        let form = if let Some(ref scope) = self.config.oauth_scope {
-            format!(
-                "grant_type=client_credentials&client_id={}&client_secret={}&scope={}",
-                urlencoding::encode(client_id),
-                urlencoding::encode(client_secret),
-                urlencoding::encode(scope)
-            )
-        } else {
-            format!(
-                "grant_type=client_credentials&client_id={}&client_secret={}",
-                urlencoding::encode(client_id),
-                urlencoding::encode(client_secret)
-            )
-        };
-
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(token_url.as_str())
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .header("Content-Length", form.len())
-            .body(Body::from(form))?;
-
-        let resp = self.client.request(req).await?;
-        let body = to_bytes(resp.into_body()).await?;
-        let json: serde_json::Value = serde_json::from_slice(&body)?;
-
-        let access_token = json["access_token"]
-            .as_str()
-            .context("No access_token in response")?
-            .to_string();
-        let expires_in = json["expires_in"].as_u64().unwrap_or(3600);
-
-        let expiry = Instant::now() + Duration::from_secs(expires_in - 60); // Refresh 1 min early
-        *self.bearer_token.write().await = Some((access_token.clone(), expiry));
-
-        info!("Refreshed LLM bearer token (expires in {}s)", expires_in);
-        Ok(access_token)
-    }
-
-    async fn clear_token(&self) {
-        *self.bearer_token.write().await = None;
-    }
-}
-
-async fn record_usage_from_response(
-    resp: Response<Body>,
-    usage_store: Arc<UsageStore>,
-    group: String,
-    request_model: Option<String>,
-    is_stream: bool,
-) -> Result<Response<Body>> {
-    debug!(
-        "Entering record_usage_from_response (is_stream={})",
-        is_stream
-    );
-    let (parts, body) = resp.into_parts();
-
-    if is_stream {
-        // Do NOT buffer streaming responses: that would de-stream the SSE and make
-        // clients like Copilot Chat hang waiting for the connection to complete.
-        // Instead we tee the body through to the client while accumulating it so we
-        // can parse the final usage chunk once the stream ends.
-        let success = parts.status.is_success();
-        struct TeeState {
-            body: Body,
-            buf: Vec<u8>,
-            usage_store: Arc<UsageStore>,
-            group: String,
-            request_model: Option<String>,
-            success: bool,
-        }
-        let state = TeeState {
-            body,
-            buf: Vec::new(),
-            usage_store,
-            group,
-            request_model,
-            success,
-        };
-        let out = stream::unfold(state, |mut state| async move {
-            match state.body.next().await {
-                Some(Ok(chunk)) => {
-                    state.buf.extend_from_slice(&chunk);
-                    Some((Ok::<Bytes, hyper::Error>(chunk), state))
-                }
-                Some(Err(e)) => Some((Err(e), state)),
-                None => {
-                    // Stream finished: parse the accumulated SSE for usage/model.
-                    if state.success {
-                        if let Some((model, cost, tokens)) =
-                            parse_sse_usage(&state.buf, state.request_model.as_deref())
-                        {
-                            debug!(
-                                "Recorded streaming usage for group={} model={} cost={:?}",
-                                state.group, model, cost
-                            );
-                            if let Err(e) = state
-                                .usage_store
-                                .record(&state.group, &model, cost, tokens)
-                                .await
-                            {
-                                warn!("Failed to record streaming usage: {}", e);
-                            }
-                        } else {
-                            debug!(
-                                "No usage found in streaming response (missing final usage chunk?)"
-                            );
-                        }
-                    }
-                    None
-                }
-            }
-        });
-        return Ok(Response::from_parts(parts, Body::wrap_stream(out)));
-    }
-
-    // Non-streaming: buffer and parse a single JSON object.
-    debug!("Reading response body for usage tracking");
-    let body_bytes = to_bytes(body).await?;
-    debug!("Response body read: len={}", body_bytes.len());
-    debug!(
-        "Usage tracking check: status={} body_len={} request_model={:?}",
-        parts.status,
-        body_bytes.len(),
-        request_model
-    );
-    if parts.status.is_success() {
-        match serde_json::from_slice::<serde_json::Value>(&body_bytes) {
-            Ok(json) => {
-                let model = json["model"]
-                    .as_str()
-                    .or_else(|| json["model_id"].as_str())
-                    .map(|s| s.to_string())
-                    .or_else(|| request_model.clone())
-                    .unwrap_or_else(|| "unknown".to_string());
-                let cost = json["cost"]["total"]
-                    .as_f64()
-                    .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()));
-                let mut tokens = BTreeMap::new();
-                if let Some(obj) = json["usage"].as_object() {
-                    for (k, v) in obj {
-                        if let Some(n) = v.as_u64() {
-                            tokens.insert(k.clone(), n);
-                        }
-                    }
-                }
-                debug!(
-                    "Recorded usage for group={} model={} cost={:?}",
-                    group, model, cost
-                );
-                if let Err(e) = usage_store.record(&group, &model, cost, tokens).await {
-                    warn!("Failed to record usage: {}", e);
-                }
-            }
-            Err(e) => {
-                debug!(
-                    "Failed to parse upstream response as JSON for usage tracking: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    Ok(Response::from_parts(parts, Body::from(body_bytes)))
-}
-
-/// Model name, optional (amount, currency) cost, and token counts parsed from a response.
-type ParsedUsage = (String, Option<(f64, String)>, BTreeMap<String, u64>);
-
-/// Parse an accumulated SSE (Server-Sent Events) body from an OpenAI-compatible
-/// streaming chat completion. Returns (model, cost, tokens) if any usage was found.
-/// Each event line looks like: `data: {json chunk}` and the stream ends with
-/// `data: [DONE]`. The `model` field is present on every chunk; token `usage`
-/// (and optionally `cost`) appears only on the final chunk.
-fn parse_sse_usage(buf: &[u8], request_model: Option<&str>) -> Option<ParsedUsage> {
-    let text = String::from_utf8_lossy(buf);
-    let mut model: Option<String> = None;
-    let mut cost: Option<(f64, String)> = None;
-    let mut tokens: BTreeMap<String, u64> = BTreeMap::new();
-    let mut found_usage = false;
-
-    for line in text.lines() {
-        let line = line.trim_start();
-        let data = match line.strip_prefix("data:") {
-            Some(d) => d.trim(),
-            None => continue,
-        };
-        if data.is_empty() || data == "[DONE]" {
-            continue;
-        }
-        let json: serde_json::Value = match serde_json::from_str(data) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-        if model.is_none() {
-            model = json["model"]
-                .as_str()
-                .or_else(|| json["model_id"].as_str())
-                .map(|s| s.to_string());
-        }
-        if let Some((amount, currency)) = json["cost"]["total"]
-            .as_f64()
-            .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()))
-        {
-            cost = Some((amount, currency));
-        }
-        if let Some(obj) = json["usage"].as_object() {
-            for (k, v) in obj {
-                if let Some(n) = v.as_u64() {
-                    tokens.insert(k.clone(), n);
-                    found_usage = true;
-                }
-            }
-        }
-    }
-
-    let model = model
-        .or_else(|| request_model.map(|s| s.to_string()))
-        .unwrap_or_else(|| "unknown".to_string());
-
-    if found_usage || cost.is_some() {
-        Some((model, cost, tokens))
-    } else {
-        None
-    }
-}
-
-async fn handle_request(
-    req: Request<Body>,
-    token_cache: Arc<TokenCache>,
-    usage_store: Arc<UsageStore>,
-    config: Arc<Config>,
-) -> Result<Response<Body>> {
-    debug!(
-        "handle_request start: method={} uri={}",
-        req.method(),
-        req.uri()
-    );
-    // Capture method and path before consuming req
-    let method = req.method().clone();
-    let path_and_query = req
-        .uri()
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/")
-        .to_string();
-
-    // Local usage endpoints
-    if method == Method::GET && path_and_query == "/llm-proxy/usage" {
-        let data = usage_store.get().await;
-        let body = serde_json::to_string_pretty(&data)?;
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "application/json")
-            .body(Body::from(body))?);
-    }
-    if method == Method::GET && path_and_query == "/llm-proxy/usage/dashboard" {
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .body(Body::from(usage_dashboard_html()))?);
-    }
-
-    // Buffer the body so we can replay it on 401 retry
-    let (parts, mut body_bytes) = {
-        let (parts, body) = req.into_parts();
-        let bytes = to_bytes(body).await?;
-        (parts, bytes)
-    };
-    let group = resolve_usage_group(&parts.headers);
-
-    // Parse the request body once so we can detect streaming, capture the model,
-    // and (for streaming) inject stream_options.include_usage.
-    let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
-
-    // Streaming requests (Copilot Chat always sets this) return an SSE event stream
-    // rather than a single JSON object. We must NOT buffer them.
-    let is_stream = parsed_body
-        .as_ref()
-        .and_then(|v| v["stream"].as_bool())
-        .unwrap_or(false);
-
-    // Extract request model for usage tracking fallback from multiple sources
-    let request_model = parsed_body
-        .as_ref()
-        .and_then(|v| {
-            v["model"]
-                .as_str()
-                .or_else(|| v["model_id"].as_str())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            parts.uri.query().and_then(|q| {
-                q.split('&').find_map(|pair| {
-                    let mut it = pair.splitn(2, '=');
-                    if it.next()? == "model" {
-                        it.next().map(|v| v.replace('+', " "))
-                    } else {
-                        None
-                    }
-                })
-            })
-        })
-        .or_else(|| {
-            parts
-                .headers
-                .get("x-model")
-                .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
-        });
-
-    // For streaming requests, ask the upstream to emit a final usage chunk.
-    // Without stream_options.include_usage the SSE stream never carries token usage.
-    if is_stream {
-        if let Some(mut v) = parsed_body.clone() {
-            if v.is_object() {
-                let opts = v.get_mut("stream_options").and_then(|o| o.as_object_mut());
-                match opts {
-                    Some(o) => {
-                        o.insert("include_usage".to_string(), serde_json::Value::Bool(true));
-                    }
-                    None => {
-                        v["stream_options"] = serde_json::json!({ "include_usage": true });
-                    }
-                }
-                if let Ok(new_bytes) = serde_json::to_vec(&v) {
-                    body_bytes = Bytes::from(new_bytes);
-                    debug!("Injected stream_options.include_usage=true for streaming request");
-                }
-            }
-        }
-    }
-
-    // Always inject auth headers and forward to configured LLM host
-    let bearer = token_cache.get_valid_bearer().await?;
-    let x_api_key = token_cache.get_x_api_key().await?;
-
-    let uri: hyper::Uri = format!("https://{}{}", config.llm_host, path_and_query).parse()?;
-    let host_only = config
-        .llm_host
-        .split('/')
-        .next()
-        .unwrap_or(&config.llm_host);
-
-    // Build a fully-injected request from the buffered body
-    let build_request = |bearer: &str, api_key: &str| -> Result<Request<Body>> {
-        let mut req_builder = Request::builder().method(method.clone()).uri(uri.clone());
-
-        // Copy original headers except hop-by-hop and auth overrides
-        for (name, value) in parts.headers.iter() {
-            let lower = name.as_str().to_lowercase();
-            if lower == "host"
-                || lower == "authorization"
-                || lower == "x-apikey"
-                || lower == "content-length"
-                || lower == "transfer-encoding"
-                || lower == "connection"
-            {
-                continue;
-            }
-            req_builder = req_builder.header(name, value);
-        }
-
-        req_builder = req_builder
-            .header(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", bearer))?,
-            )
-            .header(
-                "x-apikey".parse::<hyper::header::HeaderName>()?,
-                HeaderValue::from_str(api_key)?,
-            )
-            .header(
-                CACHE_CONTROL,
-                HeaderValue::from_static("no-cache, no-store, must-revalidate"),
-            )
-            .header(hyper::header::HOST, HeaderValue::from_str(host_only)?);
-
-        Ok(req_builder.body(Body::from(body_bytes.clone()))?)
-    };
-
-    let request = build_request(&bearer, &x_api_key)?;
-    debug!(
-        "Forwarding {} {} to {} (group={} request_model={:?})",
-        method, path_and_query, config.llm_host, group, request_model
-    );
-
-    debug!("Sending upstream request");
-    let result = match token_cache.client.request(request).await {
-        Ok(resp) => {
-            debug!("Upstream response received: status={}", resp.status());
-            if resp.status() == StatusCode::UNAUTHORIZED {
-                warn!("Got 401 from LLM - refreshing token and retrying once");
-                token_cache.clear_token().await;
-
-                let fresh_bearer = token_cache.get_valid_bearer().await?;
-                let x_api_key = token_cache.get_x_api_key().await?;
-
-                let retry_req = build_request(&fresh_bearer, &x_api_key)?;
-                info!("Retrying request with fresh token");
-                match token_cache.client.request(retry_req).await {
-                    Ok(retry_resp) => {
-                        if retry_resp.status() == StatusCode::UNAUTHORIZED {
-                            warn!("Still got 401 after token refresh");
-                        }
-                        // Record usage on successful retry too
-                        let result = record_usage_from_response(
-                            retry_resp,
-                            usage_store.clone(),
-                            group.clone(),
-                            request_model.clone(),
-                            is_stream,
-                        )
-                        .await;
-                        result
-                    }
-                    Err(e) => {
-                        error!("Retry request failed: {}", e);
-                        Ok(Response::builder()
-                            .status(StatusCode::BAD_GATEWAY)
-                            .body(Body::from("Upstream error after token refresh"))?)
-                    }
-                }
-            } else {
-                let result = record_usage_from_response(
-                    resp,
-                    usage_store.clone(),
-                    group.clone(),
-                    request_model.clone(),
-                    is_stream,
-                )
-                .await;
-                result
-            }
-        }
-        Err(e) => {
-            error!("Upstream request failed: {}", e);
-            Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("Upstream error"))?)
-        }
-    };
-    debug!(
-        "handle_request end: result_status={:?}",
-        result.as_ref().map(|r| r.status())
-    );
-    result
-}
 const SERVICE_LABEL: &str = "com.user.llm-proxy";
-const KEYCHAIN_SERVICE: &str = "llm-proxy";
 
 fn plist_path() -> Result<PathBuf> {
     let home = home_dir().context("No home directory")?;
@@ -1366,7 +161,7 @@ fn log_dir() -> Result<PathBuf> {
 
 fn binary_path() -> Result<PathBuf> {
     let current_exe = std::env::current_exe()?;
-    if current_exe.file_name().unwrap() == "llm-proxy" {
+    if current_exe.file_name().and_then(|s| s.to_str()) == Some("llm-proxy") {
         Ok(current_exe)
     } else {
         let home = home_dir().context("No home directory")?;
@@ -1374,60 +169,95 @@ fn binary_path() -> Result<PathBuf> {
     }
 }
 
-fn config_path() -> Result<PathBuf> {
+pub fn config_path() -> Result<PathBuf> {
     let home = home_dir().context("No home directory")?;
     Ok(home.join(".config/llm-proxy/config.toml"))
 }
 
-async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Result<()> {
-    let config = Config::load(config_file, Some(&args))?;
-
-    // Store secrets in keychain if requested
-    if args.use_keychain {
-        Entry::new(KEYCHAIN_SERVICE, "x-api-key")?.set_password(&config.x_api_key)?;
-        if let Some(ref token) = config.bearer_token {
-            Entry::new(KEYCHAIN_SERVICE, "bearer-token")?.set_password(token)?;
-        }
-        if let Some(ref secret) = config.client_secret {
-            Entry::new(KEYCHAIN_SERVICE, "client-secret")?.set_password(secret)?;
-        }
-        info!(
-            "Stored secrets in macOS Keychain (service: {})",
-            KEYCHAIN_SERVICE
+pub fn load_config(path_override: Option<PathBuf>) -> Result<ConfigFile> {
+    let path = path_override.unwrap_or_else(|| config_path().unwrap_or_else(|_| PathBuf::from("config.toml")));
+    if !path.exists() {
+        anyhow::bail!(
+            "Config file not found at: {}. Run 'llm-proxy install' or create it manually.",
+            path.display()
         );
     }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+    let cfg: ConfigFile = toml::from_str(&content)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    cfg.validate()?;
+    Ok(cfg)
+}
 
-    // Write config file (without secrets if keychain is used)
-    let cfg_path = config_path()?;
+async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Result<()> {
+    let cfg_path = config_file.unwrap_or_else(|| config_path().unwrap());
     if let Some(config_dir) = cfg_path.parent() {
         std::fs::create_dir_all(config_dir)?;
     }
 
-    let config_file_content = ConfigFile {
-        ca_cert_path: config.ca_cert_path.clone(),
-        llm_host: config.llm_host.clone(),
-        listen_port: config.listen_port,
-        api_key: if args.use_keychain {
-            String::new()
+    let default_prov_id = "bmw".to_string();
+
+    if args.use_keychain {
+        if let Some(ref key) = args.api_key {
+            Entry::new(KEYCHAIN_SERVICE, &format!("{}:api_key", default_prov_id))?.set_password(key)?;
+        }
+        if let Some(ref token) = args.bearer_token {
+            Entry::new(KEYCHAIN_SERVICE, &format!("{}:bearer_token", default_prov_id))?.set_password(token)?;
+        }
+        if let Some(ref secret) = args.client_secret {
+            Entry::new(KEYCHAIN_SERVICE, &format!("{}:client_secret", default_prov_id))?.set_password(secret)?;
+        }
+        info!("Stored secrets in macOS Keychain under namespace: {}", default_prov_id);
+    }
+
+    let prov = ProviderConfig {
+        id: default_prov_id.clone(),
+        base_url: args.host.unwrap_or_else(|| "api.example.com".to_string()),
+        scheme: Some("https".to_string()),
+        auth_style: if args.bearer_token.is_some() {
+            Some(crate::config::AuthStyleConfig::StaticBearer)
+        } else if args.m2m_oauth_url.is_some() {
+            Some(crate::config::AuthStyleConfig::OauthM2m)
         } else {
-            config.x_api_key.clone()
-        },
-        bearer_token: if args.use_keychain {
             None
-        } else {
-            config.bearer_token.clone()
         },
-        token_endpoint: config.token_endpoint.clone(),
-        client_id: config.client_id.clone(),
-        client_secret: if args.use_keychain {
-            None
-        } else {
-            config.client_secret.clone()
-        },
-        oauth_scope: config.oauth_scope.clone(),
-        insecure_skip_tls_verify: config.insecure_skip_tls_verify,
-        usage_store_path: Some(config.usage_store_path.to_string_lossy().to_string()),
+        api_key: if args.use_keychain { None } else { args.api_key.clone() },
+        api_key_ref: if args.use_keychain { Some(format!("keychain:{}:api_key", default_prov_id)) } else { None },
+        bearer_token: if args.use_keychain { None } else { args.bearer_token.clone() },
+        bearer_token_ref: if args.use_keychain { Some(format!("keychain:{}:bearer_token", default_prov_id)) } else { None },
+        m2m_oauth_url: args.m2m_oauth_url.clone(),
+        client_id: args.client_id.clone(),
+        client_secret: if args.use_keychain { None } else { args.client_secret.clone() },
+        client_secret_ref: if args.use_keychain { Some(format!("keychain:{}:client_secret", default_prov_id)) } else { None },
+        oauth_scope: None,
+        header_name: None,
+        header_value: None,
+        header_value_ref: None,
+        ca_cert_path: None,
+        insecure_skip_tls_verify: false,
+        models: Vec::new(),
     };
+
+    let config_file_content = ConfigFile {
+        llm_host: None,
+        listen_port: args.port,
+        api_key: None,
+        token_endpoint: None,
+        client_id: None,
+        client_secret: None,
+        oauth_scope: None,
+        bearer_token: None,
+        ca_cert_path: None,
+        insecure_skip_tls_verify: false,
+        usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
+        default_provider: default_prov_id,
+        model_separator: '/',
+        discovery_ttl_secs: 300,
+        discovery_timeout_ms: 2500,
+        providers: vec![prov],
+    };
+
     let toml_str = toml::to_string_pretty(&config_file_content)?;
     std::fs::write(&cfg_path, toml_str)?;
     info!("Wrote config file: {}", cfg_path.display());
@@ -1437,11 +267,10 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
     let out_log = log_dir.join("stdout.log");
     let err_log = log_dir.join("stderr.log");
 
-    // Build environment dict for launchd - only pass config path
     let mut env_dict = Dictionary::new();
     env_dict.insert(
         "LLM_PROXY_CONFIG".to_string(),
-        PlistValue::String(config_path()?.to_string_lossy().to_string()),
+        PlistValue::String(cfg_path.to_string_lossy().to_string()),
     );
     env_dict.insert(
         "RUST_LOG".to_string(),
@@ -1449,10 +278,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
     );
 
     let mut plist = Dictionary::new();
-    plist.insert(
-        "Label".to_string(),
-        PlistValue::String(SERVICE_LABEL.to_string()),
-    );
+    plist.insert("Label".to_string(), PlistValue::String(SERVICE_LABEL.to_string()));
     plist.insert(
         "ProgramArguments".to_string(),
         PlistValue::Array(vec![
@@ -1470,18 +296,10 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         "StandardErrorPath".to_string(),
         PlistValue::String(err_log.to_string_lossy().to_string()),
     );
-    plist.insert(
-        "EnvironmentVariables".to_string(),
-        PlistValue::Dictionary(env_dict),
-    );
+    plist.insert("EnvironmentVariables".to_string(), PlistValue::Dictionary(env_dict));
     plist.insert(
         "WorkingDirectory".to_string(),
-        PlistValue::String(
-            home_dir()
-                .ok_or_else(|| anyhow::anyhow!("No home directory"))?
-                .to_string_lossy()
-                .to_string(),
-        ),
+        PlistValue::String(home_dir().context("No home directory")?.to_string_lossy().to_string()),
     );
 
     let path = plist_path()?;
@@ -1498,9 +316,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
 }
 
 fn run_launchctl(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("launchctl")
-        .args(args)
-        .output()?;
+    let output = std::process::Command::new("launchctl").args(args).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("launchctl failed: {}", stderr);
@@ -1557,14 +373,90 @@ fn logs_service() -> Result<()> {
     Ok(())
 }
 
+fn uninstall_service() -> Result<()> {
+    let _ = stop_service();
+    let path = plist_path()?;
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+        info!("Removed plist: {}", path.display());
+    }
+
+    let cfg_path = config_path()?;
+    if cfg_path.exists() {
+        std::fs::remove_file(&cfg_path)?;
+        info!("Removed config: {}", cfg_path.display());
+    }
+
+    info!("Service uninstalled");
+    Ok(())
+}
+
+async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
+    use dialoguer::{Input, Select};
+    let path = config_path.unwrap_or_else(|| crate::config_path().unwrap());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let host: String = Input::new()
+        .with_prompt("LLM Host (e.g. api.openai.com)")
+        .interact_text()?;
+    let auth_type = Select::new()
+        .with_prompt("Authentication Method")
+        .items(&["OAuth M2M", "Static Bearer / API Key", "None"])
+        .default(0)
+        .interact()?;
+
+    let install_args = match auth_type {
+        0 => {
+            let m2m_oauth_url: String = Input::new().with_prompt("OAuth URL").interact_text()?;
+            let client_id: String = Input::new().with_prompt("Client ID").interact_text()?;
+            let client_secret: String = Input::new().with_prompt("Client Secret").interact_text()?;
+            let api_key: String = Input::new().with_prompt("X-API-Key").interact_text()?;
+            InstallArgs {
+                host: Some(host),
+                api_key: Some(api_key),
+                bearer_token: None,
+                m2m_oauth_url: Some(m2m_oauth_url),
+                client_id: Some(client_id),
+                client_secret: Some(client_secret),
+                port: 3128,
+                use_keychain: true,
+            }
+        }
+        1 => {
+            let api_key: String = Input::new().with_prompt("API Key / Bearer Token").interact_text()?;
+            InstallArgs {
+                host: Some(host),
+                api_key: Some(api_key.clone()),
+                bearer_token: Some(api_key),
+                m2m_oauth_url: None,
+                client_id: None,
+                client_secret: None,
+                port: 3128,
+                use_keychain: true,
+            }
+        }
+        _ => InstallArgs {
+            host: Some(host),
+            api_key: None,
+            bearer_token: None,
+            m2m_oauth_url: None,
+            client_id: None,
+            client_secret: None,
+            port: 3128,
+            use_keychain: false,
+        },
+    };
+
+    install_service(install_args, Some(path)).await
+}
+
 async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<()> {
+    let cfg = load_config(config_file).ok();
     let store_path = args
         .store_path
-        .or_else(|| {
-            Config::load(config_file.clone(), None)
-                .ok()
-                .map(|c| c.usage_store_path)
-        })
+        .or_else(|| cfg.as_ref().and_then(|c| c.usage_store_path.clone().map(PathBuf::from)))
         .unwrap_or_else(default_usage_store_path);
 
     let store = UsageStore::new(store_path.clone());
@@ -1585,13 +477,37 @@ async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<
 
     for (group, group_usage) in &data.groups {
         println!("\nGroup: {} ({} requests)", group, group_usage.requests);
-        for (model, model_usage) in &group_usage.models {
-            println!("  Model: {} ({} requests)", model, model_usage.requests);
-            for (currency, amount) in &model_usage.cost {
-                println!("    cost {}: {:.10}", currency, amount);
+
+        if args.by_provider {
+            for (prov, prov_usage) in &group_usage.providers {
+                if let Some(ref filter_p) = args.provider {
+                    if filter_p != prov {
+                        continue;
+                    }
+                }
+                println!("  Provider: {} ({} requests)", prov, prov_usage.requests);
+                for (model, model_usage) in &prov_usage.models {
+                    println!("    Model: {} ({} requests)", model, model_usage.requests);
+                    for (currency, amount) in &model_usage.cost {
+                        println!("      cost (reported) {}: {:.10}", currency, amount);
+                    }
+                    for (currency, amount) in &model_usage.cost_estimated {
+                        println!("      cost (estimated) {}: {:.10}", currency, amount);
+                    }
+                    for (token_type, count) in &model_usage.tokens {
+                        println!("      {}: {}", token_type, count);
+                    }
+                }
             }
-            for (token_type, count) in &model_usage.tokens {
-                println!("    {}: {}", token_type, count);
+        } else {
+            for (model, model_usage) in &group_usage.models {
+                println!("  Model: {} ({} requests)", model, model_usage.requests);
+                for (currency, amount) in &model_usage.cost {
+                    println!("    cost {}: {:.10}", currency, amount);
+                }
+                for (token_type, count) in &model_usage.tokens {
+                    println!("    {}: {}", token_type, count);
+                }
             }
         }
     }
@@ -1599,36 +515,54 @@ async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<
     Ok(())
 }
 
-fn uninstall_service() -> Result<()> {
-    let _ = stop_service();
-    let path = plist_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-        info!("Removed plist: {}", path.display());
-    }
+fn migrate_keychain(args: MigrateKeychainArgs) -> Result<()> {
+    let legacy_keys = [
+        ("x-api-key", "bmw:api_key"),
+        ("bearer-token", "bmw:bearer_token"),
+        ("client-secret", "bmw:client_secret"),
+    ];
 
-    // Remove config file
-    let cfg_path = config_path()?;
-    if cfg_path.exists() {
-        std::fs::remove_file(&cfg_path)?;
-        info!("Removed config: {}", cfg_path.display());
-    }
-
-    // Remove keychain entries (best effort)
-    for account in ["x-api-key", "bearer-token", "client-secret"] {
-        if let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, account) {
-            let _ = entry.delete_credential();
+    println!("Keychain Migration:");
+    for (legacy, new_account) in legacy_keys {
+        if let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, legacy) {
+            if let Ok(val) = entry.get_password() {
+                if args.dry_run {
+                    println!("  [DRY RUN] Found '{}', would copy to '{}'", legacy, new_account);
+                } else {
+                    let new_entry = Entry::new(KEYCHAIN_SERVICE, new_account)?;
+                    new_entry.set_password(&val)?;
+                    println!("  Copied '{}' -> '{}'", legacy, new_account);
+                }
+            } else {
+                println!("  '{}' not present in Keychain (skipping)", legacy);
+            }
         }
     }
-    info!("Removed keychain entries");
-
-    info!("Service uninstalled");
+    if args.dry_run {
+        println!("Dry run complete. No changes made.");
+    } else {
+        println!("Keychain migration complete.");
+    }
     Ok(())
 }
 
-// ============================================================================
-// Main
-// ============================================================================
+fn providers_command(_args: ProvidersArgs, config_file: Option<PathBuf>) -> Result<()> {
+    let cfg = load_config(config_file)?;
+    let (_, providers) = cfg.normalize_providers();
+
+    println!("Configured Providers (Default: {}):\n", cfg.default_provider);
+    for p in providers {
+        println!("Provider: {}", p.id);
+        println!("  Base URL: {}://{}", p.scheme.as_deref().unwrap_or("https"), p.base_url);
+        println!("  Auth Style: {:?}", p.auth_style);
+        println!("  Models configured: {}", p.models.len());
+        for m in &p.models {
+            println!("    - ID: {} (alias: {:?}, hidden: {})", m.id, m.alias, m.hidden);
+        }
+        println!();
+    }
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1649,30 +583,52 @@ async fn main() -> Result<()> {
         Command::Status => status_service(),
         Command::Logs => logs_service(),
         Command::Usage(args) => usage_command(args, cli.config).await,
+        Command::Providers(args) => providers_command(args, cli.config),
+        Command::MigrateKeychain(args) => migrate_keychain(args),
         Command::Uninstall => uninstall_service(),
     }
 }
 
 async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
-    let config = Arc::new(Config::load(config_file, None)?);
+    let config = load_config(config_file)?;
+    let registry = Arc::new(Registry::new(&config));
+    let discovery = Arc::new(DiscoveryCache::new(&config));
 
-    let token_cache = Arc::new(TokenCache::new(config.clone()));
-    let usage_store = Arc::new(UsageStore::new(config.usage_store_path.clone()));
+    let usage_store_path = config
+        .usage_store_path
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(default_usage_store_path);
+    let usage_store = Arc::new(UsageStore::new(usage_store_path));
+
+    // Warm discovery in background on startup
+    {
+        let disc = discovery.clone();
+        let reg = registry.clone();
+        tokio::spawn(async move {
+            info!("Warming model discovery cache...");
+            if let Err(e) = disc.get_models(&reg).await {
+                warn!("Initial discovery warming encountered errors: {}", e);
+            } else {
+                info!("Model discovery cache warmed successfully");
+            }
+        });
+    }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], config.listen_port));
     info!("LLM proxy listening on {}", addr);
-    info!("Target LLM host: {}", config.llm_host);
+    info!("Configured default provider: {}", registry.default_provider);
 
     let make_svc = make_service_fn(move |_| {
-        let token_cache = token_cache.clone();
+        let registry = registry.clone();
+        let discovery = discovery.clone();
         let usage_store = usage_store.clone();
-        let config = config.clone();
         async move {
             Ok::<_, anyhow::Error>(service_fn(move |req| {
-                let token_cache = token_cache.clone();
+                let registry = registry.clone();
+                let discovery = discovery.clone();
                 let usage_store = usage_store.clone();
-                let config = config.clone();
-                async move { handle_request(req, token_cache, usage_store, config).await }
+                async move { handle_request(req, registry, discovery, usage_store).await }
             }))
         }
     });
@@ -1713,12 +669,17 @@ async fn shutdown_signal() {
 }
 
 // ============================================================================
-// Tests
+// Unit and Integration Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::*;
+    use crate::provider::*;
+    use crate::proxy::*;
+    use crate::usage::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn config_file_parses_valid_toml() {
@@ -1729,9 +690,9 @@ bearer_token = "static-token-abc"
 "#;
         let cfg: ConfigFile = toml::from_str(content).unwrap();
         cfg.validate().unwrap();
-        assert_eq!(cfg.llm_host, "api.example.com");
+        assert_eq!(cfg.llm_host, Some("api.example.com".to_string()));
         assert_eq!(cfg.listen_port, 3128);
-        assert_eq!(cfg.api_key, "test-key-123");
+        assert_eq!(cfg.api_key, Some("test-key-123".to_string()));
         assert_eq!(cfg.bearer_token, Some("static-token-abc".to_string()));
     }
 
@@ -1794,21 +755,29 @@ bearer_token = "token"
     fn token_cache_uses_static_bearer() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let config = Arc::new(Config {
-                listen_port: 3128,
-                llm_host: "api.example.com".into(),
+            let p_cfg = ProviderConfig {
+                id: "test".to_string(),
+                base_url: "api.example.com".to_string(),
+                scheme: Some("https".to_string()),
+                auth_style: Some(AuthStyleConfig::StaticBearer),
+                api_key: Some("key".into()),
+                api_key_ref: None,
                 bearer_token: Some("static-token".into()),
-                x_api_key: "key".into(),
-                token_endpoint: None,
+                bearer_token_ref: None,
+                m2m_oauth_url: None,
                 client_id: None,
                 client_secret: None,
+                client_secret_ref: None,
                 oauth_scope: None,
+                header_name: None,
+                header_value: None,
+                header_value_ref: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
-                usage_store_path: PathBuf::from("/tmp/llm-proxy-test-usage.json"),
-            });
-            let cache = TokenCache::new(config);
-            let token = cache.get_valid_bearer().await.unwrap();
+                models: Vec::new(),
+            };
+            let provider = Provider::new(&p_cfg).unwrap();
+            let token = provider.token_cache.get_valid_bearer().await.unwrap();
             assert_eq!(token, "static-token");
         });
     }
@@ -1817,26 +786,31 @@ bearer_token = "token"
     fn token_cache_clear_and_repopulate() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let config = Arc::new(Config {
-                listen_port: 3128,
-                llm_host: "api.example.com".into(),
+            let p_cfg = ProviderConfig {
+                id: "test".to_string(),
+                base_url: "api.example.com".to_string(),
+                scheme: Some("https".to_string()),
+                auth_style: Some(AuthStyleConfig::StaticBearer),
+                api_key: Some("key".into()),
+                api_key_ref: None,
                 bearer_token: Some("static-token".into()),
-                x_api_key: "key".into(),
-                token_endpoint: None,
+                bearer_token_ref: None,
+                m2m_oauth_url: None,
                 client_id: None,
                 client_secret: None,
+                client_secret_ref: None,
                 oauth_scope: None,
+                header_name: None,
+                header_value: None,
+                header_value_ref: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
-                usage_store_path: PathBuf::from("/tmp/llm-proxy-test-usage.json"),
-            });
-            let cache = TokenCache::new(config);
-            // First call populates
-            let _ = cache.get_valid_bearer().await.unwrap();
-            // Clear the cached token
-            cache.clear_token().await;
-            // Should still get static token
-            let token = cache.get_valid_bearer().await.unwrap();
+                models: Vec::new(),
+            };
+            let provider = Provider::new(&p_cfg).unwrap();
+            let _ = provider.token_cache.get_valid_bearer().await.unwrap();
+            provider.token_cache.clear_token().await;
+            let token = provider.token_cache.get_valid_bearer().await.unwrap();
             assert_eq!(token, "static-token");
         });
     }
@@ -1845,21 +819,29 @@ bearer_token = "token"
     fn token_cache_returns_x_api_key() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let config = Arc::new(Config {
-                listen_port: 3128,
-                llm_host: "api.example.com".into(),
+            let p_cfg = ProviderConfig {
+                id: "test".to_string(),
+                base_url: "api.example.com".to_string(),
+                scheme: Some("https".to_string()),
+                auth_style: Some(AuthStyleConfig::StaticBearer),
+                api_key: Some("my-api-key".into()),
+                api_key_ref: None,
                 bearer_token: Some("token".into()),
-                x_api_key: "my-api-key".into(),
-                token_endpoint: None,
+                bearer_token_ref: None,
+                m2m_oauth_url: None,
                 client_id: None,
                 client_secret: None,
+                client_secret_ref: None,
                 oauth_scope: None,
+                header_name: None,
+                header_value: None,
+                header_value_ref: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
-                usage_store_path: PathBuf::from("/tmp/llm-proxy-test-usage.json"),
-            });
-            let cache = TokenCache::new(config);
-            let key = cache.get_x_api_key().await.unwrap();
+                models: Vec::new(),
+            };
+            let provider = Provider::new(&p_cfg).unwrap();
+            let key = provider.token_cache.get_x_api_key().await.unwrap();
             assert_eq!(key, "my-api-key");
         });
     }
@@ -1969,41 +951,31 @@ insecure_skip_tls_verify = true
                 .unwrap_or_else(|| "unknown".to_string())
         };
 
-        // Body fallback
         assert_eq!(
             resolve(r#"{"model":"gpt-4o-mini"}"#, None, None),
             "gpt-4o-mini"
         );
-
-        // Query fallback
         assert_eq!(
             resolve("{}", Some("model=claude-3-5-sonnet"), None),
             "claude-3-5-sonnet"
         );
-
-        // Header fallback
         assert_eq!(
             resolve("{}", None, Some("custom-model-v1")),
             "custom-model-v1"
         );
 
-        // When response has no model, fallback is used
+        let resolve_with_resp = |resp: &serde_json::Value, req_m: Option<String>| {
+            resp["model"]
+                .as_str()
+                .or_else(|| resp["model_id"].as_str())
+                .map(|s| s.to_string())
+                .or(req_m)
+                .unwrap_or_else(|| "unknown".to_string())
+        };
         assert_eq!(
-            resolve_with_response(&response_json, Some("gpt-4o-mini".to_string())),
+            resolve_with_resp(&response_json, Some("gpt-4o-mini".to_string())),
             "gpt-4o-mini"
         );
-    }
-
-    fn resolve_with_response(
-        response_json: &serde_json::Value,
-        request_model: Option<String>,
-    ) -> String {
-        response_json["model"]
-            .as_str()
-            .or_else(|| response_json["model_id"].as_str())
-            .map(|s| s.to_string())
-            .or_else(|| request_model.clone())
-            .unwrap_or_else(|| "unknown".to_string())
     }
 
     #[test]
@@ -2018,7 +990,7 @@ insecure_skip_tls_verify = true
             "data: [DONE]\n"
         );
         let (model, cost, tokens) = parse_sse_usage(sse.as_bytes(), None).unwrap();
-        assert_eq!(model, "gpt-4o");
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
         assert_eq!(cost, None);
         assert_eq!(tokens.get("prompt_tokens").unwrap(), &11);
         assert_eq!(tokens.get("completion_tokens").unwrap(), &7);
@@ -2036,7 +1008,7 @@ insecure_skip_tls_verify = true
         );
         let (model, cost, tokens) =
             parse_sse_usage(sse.as_bytes(), Some("claude-3-5-sonnet")).unwrap();
-        assert_eq!(model, "claude-3-5-sonnet");
+        assert_eq!(model.as_deref(), Some("claude-3-5-sonnet"));
         assert_eq!(cost, Some((0.0042, "USD".to_string())));
         assert_eq!(tokens.get("total_tokens").unwrap(), &5);
     }
@@ -2056,13 +1028,12 @@ insecure_skip_tls_verify = true
             "data: [DONE]\n"
         );
         let (model, _, tokens) = parse_sse_usage(sse.as_bytes(), None).unwrap();
-        assert_eq!(model, "gpt-4o");
+        assert_eq!(model.as_deref(), Some("gpt-4o"));
         assert_eq!(tokens.get("total_tokens").unwrap(), &3);
     }
 
     #[test]
     fn stream_flag_detected_and_stream_options_injected() {
-        // Mirrors the logic in handle_request for streaming requests
         fn prepare(body: &str) -> (bool, serde_json::Value) {
             let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
             let is_stream = parsed
@@ -2086,7 +1057,6 @@ insecure_skip_tls_verify = true
             (is_stream, out)
         }
 
-        // Copilot-style streaming request
         let (is_stream, out) = prepare(r#"{"model":"gpt-4o","stream":true}"#);
         assert!(is_stream);
         assert_eq!(
@@ -2094,7 +1064,6 @@ insecure_skip_tls_verify = true
             serde_json::json!(true)
         );
 
-        // Existing stream_options are preserved, include_usage added
         let (is_stream, out) =
             prepare(r#"{"model":"gpt-4o","stream":true,"stream_options":{"foo":1}}"#);
         assert!(is_stream);
@@ -2104,7 +1073,6 @@ insecure_skip_tls_verify = true
             serde_json::json!(true)
         );
 
-        // curl-style non-streaming request is untouched
         let (is_stream, out) = prepare(r#"{"model":"gpt-4o","temperature":0.7}"#);
         assert!(!is_stream);
         assert!(out.get("stream_options").is_none());
@@ -2138,5 +1106,173 @@ usage_store_path = "/custom/usage.json"
 "#;
         let cfg: ConfigFile = toml::from_str(content).unwrap();
         assert_eq!(cfg.usage_store_path, Some("/custom/usage.json".to_string()));
+    }
+
+    // ========================================================================
+    // Multi-Provider New Test Cases
+    // ========================================================================
+
+    #[tokio::test]
+    async fn routing_precedence_all_cases() {
+        let toml_str = r#"
+default_provider = "bmw"
+model_separator = "/"
+
+[[providers]]
+id = "bmw"
+base_url = "api.bmw.com"
+auth_style = "bearer_api_key"
+api_key = "bmw-key"
+
+  [[providers.models]]
+  id = "gpt-4o"
+  alias = "fast"
+
+[[providers]]
+id = "openai"
+base_url = "api.openai.com"
+auth_style = "bearer_api_key"
+api_key = "openai-key"
+
+  [[providers.models]]
+  id = "gpt-4o"
+  alias = "o-fast"
+
+  [[providers.models]]
+  id = "o3-mini"
+"#;
+        let cfg: ConfigFile = toml::from_str(toml_str).unwrap();
+        let registry = Registry::new(&cfg);
+
+        // 1. Prefixed model
+        let r1 = registry.resolve_route(Some("openai/gpt-4o"), None).await.unwrap();
+        assert_eq!(r1.provider.id, "openai");
+        assert_eq!(r1.upstream_model, "gpt-4o");
+        assert_eq!(r1.canonical_model, "openai/gpt-4o");
+
+        // 1b. Unknown provider prefix -> error
+        assert!(registry.resolve_route(Some("unknown/model"), None).await.is_err());
+
+        // 2. Alias
+        let r2 = registry.resolve_route(Some("fast"), None).await.unwrap();
+        assert_eq!(r2.provider.id, "bmw");
+        assert_eq!(r2.canonical_model, "bmw/gpt-4o");
+
+        // 3. x-llm-provider header
+        let r3 = registry.resolve_route(Some("gpt-4o"), Some("openai")).await.unwrap();
+        assert_eq!(r3.provider.id, "openai");
+        assert_eq!(r3.canonical_model, "openai/gpt-4o");
+
+        // 4. Unique bare-name match (o3-mini is only in openai)
+        let r4 = registry.resolve_route(Some("o3-mini"), None).await.unwrap();
+        assert_eq!(r4.provider.id, "openai");
+        assert_eq!(r4.canonical_model, "openai/o3-mini");
+
+        // 4b. Ambiguous bare name without provider (gpt-4o is in both bmw and openai)
+        let r_amb = registry.resolve_route(Some("gpt-4o"), None).await;
+        assert!(r_amb.is_err());
+        assert!(r_amb.unwrap_err().to_string().contains("Ambiguous model 'gpt-4o'"));
+
+        // 5. Fallback to default_provider for unknown un-indexed model
+        let r5 = registry.resolve_route(Some("unlisted-model"), None).await.unwrap();
+        assert_eq!(r5.provider.id, "bmw");
+        assert_eq!(r5.upstream_model, "unlisted-model");
+        assert_eq!(r5.canonical_model, "bmw/unlisted-model");
+    }
+
+    #[tokio::test]
+    async fn usage_v1_to_v2_migration() {
+        let v1_json = r#"{
+            "groups": {
+                "team-1": {
+                    "requests": 2,
+                    "models": {
+                        "gpt-4o": {
+                            "requests": 2,
+                            "cost": {"USD": 0.05},
+                            "tokens": {"prompt_tokens": 500}
+                        }
+                    },
+                    "totals": {"USD": 0.05, "prompt_tokens_tokens": 500.0}
+                }
+            },
+            "global_requests": 2,
+            "global_totals": {"USD": 0.05, "prompt_tokens_tokens": 500.0}
+        }"#;
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), v1_json).unwrap();
+
+        let store = UsageStore::new(tmp.path().to_path_buf());
+        let data = store.get().await;
+
+        assert_eq!(data.schema_version, 2);
+        assert_eq!(data.global_requests, 2);
+        assert_eq!(data.global_totals.get("USD").unwrap(), &0.05);
+
+        let group = data.groups.get("team-1").unwrap();
+        assert!(group.providers.contains_key("default"));
+        let prov_usage = group.providers.get("default").unwrap();
+        assert_eq!(prov_usage.requests, 2);
+        assert_eq!(prov_usage.models.get("gpt-4o").unwrap().requests, 2);
+
+        // Check that backup file was created
+        let bak_path = format!("{}.v1.bak", tmp.path().display());
+        assert!(std::path::Path::new(&bak_path).exists());
+    }
+
+    #[test]
+    fn cost_estimation_math() {
+        let p_cfg = ProviderConfig {
+            id: "openai".to_string(),
+            base_url: "api.openai.com".to_string(),
+            scheme: Some("https".to_string()),
+            auth_style: Some(AuthStyleConfig::BearerApiKey),
+            api_key: Some("key".to_string()),
+            api_key_ref: None,
+            bearer_token: None,
+            bearer_token_ref: None,
+            m2m_oauth_url: None,
+            client_id: None,
+            client_secret: None,
+            client_secret_ref: None,
+            oauth_scope: None,
+            header_name: None,
+            header_value: None,
+            header_value_ref: None,
+            ca_cert_path: None,
+            insecure_skip_tls_verify: false,
+            models: vec![ModelSpec {
+                id: "gpt-4o".to_string(),
+                alias: None,
+                context_window: Some(128000),
+                max_output_tokens: Some(4096),
+                supports_tools: Some(true),
+                input_cost_per_1m: Some(2.50),
+                output_cost_per_1m: Some(10.00),
+                currency: "USD".to_string(),
+                hidden: false,
+            }],
+        };
+        let prov = Provider::new(&p_cfg).unwrap();
+
+        let mut tokens = BTreeMap::new();
+        tokens.insert("prompt_tokens".to_string(), 1_000_000_u64);
+        tokens.insert("completion_tokens".to_string(), 500_000_u64);
+
+        let (est_cost, currency) = estimate_cost(&tokens, &prov, "openai/gpt-4o").unwrap();
+        assert_eq!(currency, "USD");
+        assert_eq!(est_cost, 2.50 + 5.00); // 2.50 + 5.00 = 7.50
+    }
+
+    #[test]
+    fn traffic_classification_rules() {
+        let mut h = hyper::HeaderMap::new();
+        assert_eq!(classify_traffic("/llm-proxy/usage", &h), TrafficClass::Local);
+        assert_eq!(classify_traffic("/v1/models", &h), TrafficClass::Discovery);
+        assert_eq!(classify_traffic("/v1/chat/completions", &h), TrafficClass::Billable);
+
+        h.insert("x-llm-probe", "true".parse().unwrap());
+        assert_eq!(classify_traffic("/v1/chat/completions", &h), TrafficClass::Probe);
     }
 }
