@@ -392,65 +392,263 @@ fn uninstall_service() -> Result<()> {
 }
 
 async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
-    use dialoguer::{Input, Select};
+    use dialoguer::{Confirm, Input, Select};
     let path = config_path.unwrap_or_else(|| crate::config_path().unwrap());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let host: String = Input::new()
-        .with_prompt("LLM Host (e.g. api.openai.com)")
-        .interact_text()?;
-    let auth_type = Select::new()
-        .with_prompt("Authentication Method")
-        .items(&["OAuth M2M", "Static Bearer / API Key", "None"])
-        .default(0)
-        .interact()?;
-
-    let install_args = match auth_type {
-        0 => {
-            let m2m_oauth_url: String = Input::new().with_prompt("OAuth URL").interact_text()?;
-            let client_id: String = Input::new().with_prompt("Client ID").interact_text()?;
-            let client_secret: String = Input::new().with_prompt("Client Secret").interact_text()?;
-            let api_key: String = Input::new().with_prompt("X-API-Key").interact_text()?;
-            InstallArgs {
-                host: Some(host),
-                api_key: Some(api_key),
-                bearer_token: None,
-                m2m_oauth_url: Some(m2m_oauth_url),
-                client_id: Some(client_id),
-                client_secret: Some(client_secret),
-                port: 3128,
-                use_keychain: true,
-            }
-        }
-        1 => {
-            let api_key: String = Input::new().with_prompt("API Key / Bearer Token").interact_text()?;
-            InstallArgs {
-                host: Some(host),
-                api_key: Some(api_key.clone()),
-                bearer_token: Some(api_key),
-                m2m_oauth_url: None,
+    let mut config = if path.exists() {
+        println!("Existing config found at: {}", path.display());
+        match load_config(Some(path.clone())) {
+            Ok(c) => c,
+            Err(_) => ConfigFile {
+                llm_host: None,
+                listen_port: 3128,
+                api_key: None,
+                token_endpoint: None,
                 client_id: None,
                 client_secret: None,
-                port: 3128,
-                use_keychain: true,
-            }
+                oauth_scope: None,
+                bearer_token: None,
+                ca_cert_path: None,
+                insecure_skip_tls_verify: false,
+                usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
+                default_provider: "bmw".to_string(),
+                model_separator: '/',
+                discovery_ttl_secs: 300,
+                discovery_timeout_ms: 2500,
+                providers: Vec::new(),
+            },
         }
-        _ => InstallArgs {
-            host: Some(host),
+    } else {
+        ConfigFile {
+            llm_host: None,
+            listen_port: 3128,
             api_key: None,
-            bearer_token: None,
-            m2m_oauth_url: None,
+            token_endpoint: None,
             client_id: None,
             client_secret: None,
-            port: 3128,
-            use_keychain: false,
-        },
+            oauth_scope: None,
+            bearer_token: None,
+            ca_cert_path: None,
+            insecure_skip_tls_verify: false,
+            usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
+            default_provider: "bmw".to_string(),
+            model_separator: '/',
+            discovery_ttl_secs: 300,
+            discovery_timeout_ms: 2500,
+            providers: Vec::new(),
+        }
     };
 
-    install_service(install_args, Some(path)).await
+    println!("=== LLM Proxy Multi-Provider Setup ===\n");
+
+    loop {
+        let action = Select::new()
+            .with_prompt("What would you like to configure?")
+            .items(&[
+                "Add a new Provider",
+                "Set Default Provider",
+                "Set Global Settings (port, separator, discovery TTL)",
+                "Save and Exit",
+                "Exit without saving",
+            ])
+            .default(0)
+            .interact()?;
+
+        match action {
+            0 => {
+                let id: String = Input::new()
+                    .with_prompt("Provider ID (e.g., bmw, openai, anthropic, ollama)")
+                    .interact_text()?;
+
+                let base_url: String = Input::new()
+                    .with_prompt("Base URL / Host (e.g. api.openai.com, api.internal.bmw.com, 127.0.0.1:11434/v1)")
+                    .interact_text()?;
+
+                let scheme_choice = Select::new()
+                    .with_prompt("Scheme")
+                    .items(&["https", "http"])
+                    .default(0)
+                    .interact()?;
+                let scheme = if scheme_choice == 0 { "https" } else { "http" };
+
+                let auth_choice = Select::new()
+                    .with_prompt("Authentication Style")
+                    .items(&[
+                        "Bearer API Key (e.g. OpenAI / Standard)",
+                        "OAuth M2M Client Credentials (e.g. BMW Gateway)",
+                        "Static Bearer Token",
+                        "Custom Header (e.g. x-api-key)",
+                        "None / Local (e.g. Ollama)",
+                    ])
+                    .default(0)
+                    .interact()?;
+
+                let use_keychain = Confirm::new()
+                    .with_prompt("Store secret credentials securely in macOS Keychain?")
+                    .default(true)
+                    .interact()?;
+
+                let mut prov = ProviderConfig {
+                    id: id.clone(),
+                    base_url,
+                    scheme: Some(scheme.to_string()),
+                    auth_style: None,
+                    api_key: None,
+                    api_key_ref: None,
+                    bearer_token: None,
+                    bearer_token_ref: None,
+                    m2m_oauth_url: None,
+                    client_id: None,
+                    client_secret: None,
+                    client_secret_ref: None,
+                    oauth_scope: None,
+                    header_name: None,
+                    header_value: None,
+                    header_value_ref: None,
+                    ca_cert_path: None,
+                    insecure_skip_tls_verify: false,
+                    models: Vec::new(),
+                };
+
+                match auth_choice {
+                    0 => {
+                        prov.auth_style = Some(crate::config::AuthStyleConfig::BearerApiKey);
+                        let key: String = Input::new().with_prompt("API Key").interact_text()?;
+                        if use_keychain {
+                            let account = format!("{}:api_key", id);
+                            Entry::new(KEYCHAIN_SERVICE, &account)?.set_password(&key)?;
+                            prov.api_key_ref = Some(format!("keychain:{}", account));
+                        } else {
+                            prov.api_key = Some(key);
+                        }
+                    }
+                    1 => {
+                        prov.auth_style = Some(crate::config::AuthStyleConfig::OauthM2m);
+                        let oauth_url: String = Input::new().with_prompt("M2M OAuth Token Endpoint URL").interact_text()?;
+                        let client_id: String = Input::new().with_prompt("Client ID").interact_text()?;
+                        let client_secret: String = Input::new().with_prompt("Client Secret").interact_text()?;
+                        let api_key: String = Input::new().with_prompt("X-API-Key (gateway header)").interact_text()?;
+                        let scope: String = Input::new()
+                            .with_prompt("OAuth Scope (optional, press Enter to skip)")
+                            .allow_empty(true)
+                            .interact_text()?;
+
+                        prov.m2m_oauth_url = Some(oauth_url);
+                        prov.client_id = Some(client_id);
+                        if !scope.is_empty() {
+                            prov.oauth_scope = Some(scope);
+                        }
+
+                        if use_keychain {
+                            let sec_acc = format!("{}:client_secret", id);
+                            let key_acc = format!("{}:api_key", id);
+                            Entry::new(KEYCHAIN_SERVICE, &sec_acc)?.set_password(&client_secret)?;
+                            Entry::new(KEYCHAIN_SERVICE, &key_acc)?.set_password(&api_key)?;
+                            prov.client_secret_ref = Some(format!("keychain:{}", sec_acc));
+                            prov.api_key_ref = Some(format!("keychain:{}", key_acc));
+                        } else {
+                            prov.client_secret = Some(client_secret);
+                            prov.api_key = Some(api_key);
+                        }
+                    }
+                    2 => {
+                        prov.auth_style = Some(crate::config::AuthStyleConfig::StaticBearer);
+                        let token: String = Input::new().with_prompt("Bearer Token").interact_text()?;
+                        if use_keychain {
+                            let account = format!("{}:bearer_token", id);
+                            Entry::new(KEYCHAIN_SERVICE, &account)?.set_password(&token)?;
+                            prov.bearer_token_ref = Some(format!("keychain:{}", account));
+                        } else {
+                            prov.bearer_token = Some(token);
+                        }
+                    }
+                    3 => {
+                        prov.auth_style = Some(crate::config::AuthStyleConfig::CustomHeader);
+                        let h_name: String = Input::new().with_prompt("Header Name (e.g. x-api-key)").interact_text()?;
+                        let h_val: String = Input::new().with_prompt("Header Value / Secret").interact_text()?;
+                        prov.header_name = Some(h_name);
+                        if use_keychain {
+                            let account = format!("{}:header_val", id);
+                            Entry::new(KEYCHAIN_SERVICE, &account)?.set_password(&h_val)?;
+                            prov.header_value_ref = Some(format!("keychain:{}", account));
+                        } else {
+                            prov.header_value = Some(h_val);
+                        }
+                    }
+                    4 => {
+                        prov.auth_style = Some(crate::config::AuthStyleConfig::None);
+                    }
+                    _ => {}
+                }
+
+                // Remove previous definition if exists
+                config.providers.retain(|p| p.id != id);
+                config.providers.push(prov);
+                if config.default_provider.is_empty() {
+                    config.default_provider = id.clone();
+                }
+                println!("Provider '{}' configured successfully.\n", id);
+            }
+            1 => {
+                if config.providers.is_empty() {
+                    println!("No providers configured yet. Please add a provider first.\n");
+                } else {
+                    let prov_names: Vec<String> = config.providers.iter().map(|p| p.id.clone()).collect();
+                    let sel = Select::new()
+                        .with_prompt("Select default provider")
+                        .items(&prov_names)
+                        .default(0)
+                        .interact()?;
+                    config.default_provider = prov_names[sel].clone();
+                    println!("Default provider set to: {}\n", config.default_provider);
+                }
+            }
+            2 => {
+                let port_str: String = Input::new()
+                    .with_prompt("Listen Port")
+                    .default(config.listen_port.to_string())
+                    .interact_text()?;
+                if let Ok(p) = port_str.parse::<u16>() {
+                    config.listen_port = p;
+                }
+
+                let sep_str: String = Input::new()
+                    .with_prompt("Model Separator char (e.g. / or . or __)")
+                    .default(config.model_separator.to_string())
+                    .interact_text()?;
+                if let Some(c) = sep_str.chars().next() {
+                    config.model_separator = c;
+                }
+
+                let ttl_str: String = Input::new()
+                    .with_prompt("Discovery TTL (seconds)")
+                    .default(config.discovery_ttl_secs.to_string())
+                    .interact_text()?;
+                if let Ok(ttl) = ttl_str.parse::<u64>() {
+                    config.discovery_ttl_secs = ttl;
+                }
+                println!("Global settings updated.\n");
+            }
+            3 => {
+                let toml_str = toml::to_string_pretty(&config)?;
+                std::fs::write(&path, toml_str)?;
+                println!("Configuration saved to: {}", path.display());
+                break;
+            }
+            4 => {
+                println!("Setup exited without saving.");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
+
 
 async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<()> {
     let cfg = load_config(config_file).ok();
