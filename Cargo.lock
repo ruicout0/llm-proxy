@@ -924,9 +924,11 @@ name = "llm-proxy"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "dialoguer",
  "dirs",
+ "futures-util",
  "hyper",
  "hyper-rustls",
  "keyring",

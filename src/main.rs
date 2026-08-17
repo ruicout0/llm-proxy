@@ -21,8 +21,10 @@
 //!   # bearer_token = "static-token"  # Optional: use instead of OAuth
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
 use dirs::home_dir;
+use futures_util::{stream, StreamExt};
 use hyper::body::to_bytes;
 use hyper::client::HttpConnector;
 use hyper::server::Server;
@@ -944,16 +946,80 @@ impl TokenCache {
 
 async fn record_usage_from_response(
     resp: Response<Body>,
-    usage_store: &UsageStore,
-    group: &str,
-    request_model: Option<&str>,
+    usage_store: Arc<UsageStore>,
+    group: String,
+    request_model: Option<String>,
+    is_stream: bool,
 ) -> Result<Response<Body>> {
-    debug!("Entering record_usage_from_response");
+    debug!(
+        "Entering record_usage_from_response (is_stream={})",
+        is_stream
+    );
     let (parts, body) = resp.into_parts();
+
+    if is_stream {
+        // Do NOT buffer streaming responses: that would de-stream the SSE and make
+        // clients like Copilot Chat hang waiting for the connection to complete.
+        // Instead we tee the body through to the client while accumulating it so we
+        // can parse the final usage chunk once the stream ends.
+        let success = parts.status.is_success();
+        struct TeeState {
+            body: Body,
+            buf: Vec<u8>,
+            usage_store: Arc<UsageStore>,
+            group: String,
+            request_model: Option<String>,
+            success: bool,
+        }
+        let state = TeeState {
+            body,
+            buf: Vec::new(),
+            usage_store,
+            group,
+            request_model,
+            success,
+        };
+        let out = stream::unfold(state, |mut state| async move {
+            match state.body.next().await {
+                Some(Ok(chunk)) => {
+                    state.buf.extend_from_slice(&chunk);
+                    Some((Ok::<Bytes, hyper::Error>(chunk), state))
+                }
+                Some(Err(e)) => Some((Err(e), state)),
+                None => {
+                    // Stream finished: parse the accumulated SSE for usage/model.
+                    if state.success {
+                        if let Some((model, cost, tokens)) =
+                            parse_sse_usage(&state.buf, state.request_model.as_deref())
+                        {
+                            debug!(
+                                "Recorded streaming usage for group={} model={} cost={:?}",
+                                state.group, model, cost
+                            );
+                            if let Err(e) = state
+                                .usage_store
+                                .record(&state.group, &model, cost, tokens)
+                                .await
+                            {
+                                warn!("Failed to record streaming usage: {}", e);
+                            }
+                        } else {
+                            debug!(
+                                "No usage found in streaming response (missing final usage chunk?)"
+                            );
+                        }
+                    }
+                    None
+                }
+            }
+        });
+        return Ok(Response::from_parts(parts, Body::wrap_stream(out)));
+    }
+
+    // Non-streaming: buffer and parse a single JSON object.
     debug!("Reading response body for usage tracking");
     let body_bytes = to_bytes(body).await?;
     debug!("Response body read: len={}", body_bytes.len());
-
     debug!(
         "Usage tracking check: status={} body_len={} request_model={:?}",
         parts.status,
@@ -967,7 +1033,7 @@ async fn record_usage_from_response(
                     .as_str()
                     .or_else(|| json["model_id"].as_str())
                     .map(|s| s.to_string())
-                    .or_else(|| request_model.map(|s| s.to_string()))
+                    .or_else(|| request_model.clone())
                     .unwrap_or_else(|| "unknown".to_string());
                 let cost = json["cost"]["total"]
                     .as_f64()
@@ -984,7 +1050,7 @@ async fn record_usage_from_response(
                     "Recorded usage for group={} model={} cost={:?}",
                     group, model, cost
                 );
-                if let Err(e) = usage_store.record(group, &model, cost, tokens).await {
+                if let Err(e) = usage_store.record(&group, &model, cost, tokens).await {
                     warn!("Failed to record usage: {}", e);
                 }
             }
@@ -998,6 +1064,67 @@ async fn record_usage_from_response(
     }
 
     Ok(Response::from_parts(parts, Body::from(body_bytes)))
+}
+
+/// Model name, optional (amount, currency) cost, and token counts parsed from a response.
+type ParsedUsage = (String, Option<(f64, String)>, BTreeMap<String, u64>);
+
+/// Parse an accumulated SSE (Server-Sent Events) body from an OpenAI-compatible
+/// streaming chat completion. Returns (model, cost, tokens) if any usage was found.
+/// Each event line looks like: `data: {json chunk}` and the stream ends with
+/// `data: [DONE]`. The `model` field is present on every chunk; token `usage`
+/// (and optionally `cost`) appears only on the final chunk.
+fn parse_sse_usage(buf: &[u8], request_model: Option<&str>) -> Option<ParsedUsage> {
+    let text = String::from_utf8_lossy(buf);
+    let mut model: Option<String> = None;
+    let mut cost: Option<(f64, String)> = None;
+    let mut tokens: BTreeMap<String, u64> = BTreeMap::new();
+    let mut found_usage = false;
+
+    for line in text.lines() {
+        let line = line.trim_start();
+        let data = match line.strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let json: serde_json::Value = match serde_json::from_str(data) {
+            Ok(j) => j,
+            Err(_) => continue,
+        };
+        if model.is_none() {
+            model = json["model"]
+                .as_str()
+                .or_else(|| json["model_id"].as_str())
+                .map(|s| s.to_string());
+        }
+        if let Some((amount, currency)) = json["cost"]["total"]
+            .as_f64()
+            .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()))
+        {
+            cost = Some((amount, currency));
+        }
+        if let Some(obj) = json["usage"].as_object() {
+            for (k, v) in obj {
+                if let Some(n) = v.as_u64() {
+                    tokens.insert(k.clone(), n);
+                    found_usage = true;
+                }
+            }
+        }
+    }
+
+    let model = model
+        .or_else(|| request_model.map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    if found_usage || cost.is_some() {
+        Some((model, cost, tokens))
+    } else {
+        None
+    }
 }
 
 async fn handle_request(
@@ -1037,13 +1164,27 @@ async fn handle_request(
     }
 
     // Buffer the body so we can replay it on 401 retry
-    let (parts, body) = req.into_parts();
+    let (parts, mut body_bytes) = {
+        let (parts, body) = req.into_parts();
+        let bytes = to_bytes(body).await?;
+        (parts, bytes)
+    };
     let group = resolve_usage_group(&parts.headers);
-    let body_bytes = to_bytes(body).await?;
+
+    // Parse the request body once so we can detect streaming, capture the model,
+    // and (for streaming) inject stream_options.include_usage.
+    let parsed_body: Option<serde_json::Value> = serde_json::from_slice(&body_bytes).ok();
+
+    // Streaming requests (Copilot Chat always sets this) return an SSE event stream
+    // rather than a single JSON object. We must NOT buffer them.
+    let is_stream = parsed_body
+        .as_ref()
+        .and_then(|v| v["stream"].as_bool())
+        .unwrap_or(false);
 
     // Extract request model for usage tracking fallback from multiple sources
-    let request_model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
+    let request_model = parsed_body
+        .as_ref()
         .and_then(|v| {
             v["model"]
                 .as_str()
@@ -1069,6 +1210,28 @@ async fn handle_request(
                 .and_then(|v| v.to_str().ok().map(|s| s.to_string()))
         });
 
+    // For streaming requests, ask the upstream to emit a final usage chunk.
+    // Without stream_options.include_usage the SSE stream never carries token usage.
+    if is_stream {
+        if let Some(mut v) = parsed_body.clone() {
+            if v.is_object() {
+                let opts = v.get_mut("stream_options").and_then(|o| o.as_object_mut());
+                match opts {
+                    Some(o) => {
+                        o.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+                    }
+                    None => {
+                        v["stream_options"] = serde_json::json!({ "include_usage": true });
+                    }
+                }
+                if let Ok(new_bytes) = serde_json::to_vec(&v) {
+                    body_bytes = Bytes::from(new_bytes);
+                    debug!("Injected stream_options.include_usage=true for streaming request");
+                }
+            }
+        }
+    }
+
     // Always inject auth headers and forward to configured LLM host
     let bearer = token_cache.get_valid_bearer().await?;
     let x_api_key = token_cache.get_x_api_key().await?;
@@ -1090,6 +1253,7 @@ async fn handle_request(
             if lower == "host"
                 || lower == "authorization"
                 || lower == "x-apikey"
+                || lower == "content-length"
                 || lower == "transfer-encoding"
                 || lower == "connection"
             {
@@ -1143,9 +1307,10 @@ async fn handle_request(
                         // Record usage on successful retry too
                         let result = record_usage_from_response(
                             retry_resp,
-                            &usage_store,
-                            &group,
-                            request_model.as_deref(),
+                            usage_store.clone(),
+                            group.clone(),
+                            request_model.clone(),
+                            is_stream,
                         )
                         .await;
                         result
@@ -1160,9 +1325,10 @@ async fn handle_request(
             } else {
                 let result = record_usage_from_response(
                     resp,
-                    &usage_store,
-                    &group,
-                    request_model.as_deref(),
+                    usage_store.clone(),
+                    group.clone(),
+                    request_model.clone(),
+                    is_stream,
                 )
                 .await;
                 result
@@ -1838,6 +2004,110 @@ insecure_skip_tls_verify = true
             .map(|s| s.to_string())
             .or_else(|| request_model.clone())
             .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    #[test]
+    fn parse_sse_usage_extracts_model_and_tokens_from_final_chunk() {
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"role\":\"assistant\"}}],\"usage\":null}\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n",
+            "\n",
+            "data: {\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7,\"total_tokens\":18}}\n",
+            "\n",
+            "data: [DONE]\n"
+        );
+        let (model, cost, tokens) = parse_sse_usage(sse.as_bytes(), None).unwrap();
+        assert_eq!(model, "gpt-4o");
+        assert_eq!(cost, None);
+        assert_eq!(tokens.get("prompt_tokens").unwrap(), &11);
+        assert_eq!(tokens.get("completion_tokens").unwrap(), &7);
+        assert_eq!(tokens.get("total_tokens").unwrap(), &18);
+    }
+
+    #[test]
+    fn parse_sse_usage_reads_cost_and_falls_back_to_request_model() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n",
+            "\n",
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":5},\"cost\":{\"total\":0.0042,\"currency\":\"USD\"}}\n",
+            "\n",
+            "data: [DONE]\n"
+        );
+        let (model, cost, tokens) =
+            parse_sse_usage(sse.as_bytes(), Some("claude-3-5-sonnet")).unwrap();
+        assert_eq!(model, "claude-3-5-sonnet");
+        assert_eq!(cost, Some((0.0042, "USD".to_string())));
+        assert_eq!(tokens.get("total_tokens").unwrap(), &5);
+    }
+
+    #[test]
+    fn parse_sse_usage_returns_none_without_usage_or_cost() {
+        let sse = "data: {\"model\":\"gpt-4o\",\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\ndata: [DONE]\n";
+        assert!(parse_sse_usage(sse.as_bytes(), None).is_none());
+    }
+
+    #[test]
+    fn parse_sse_usage_ignores_malformed_lines() {
+        let sse = concat!(
+            "event: ping\n",
+            "data: not-json\n",
+            "data: {\"model\":\"gpt-4o\",\"choices\":[],\"usage\":{\"total_tokens\":3}}\n",
+            "data: [DONE]\n"
+        );
+        let (model, _, tokens) = parse_sse_usage(sse.as_bytes(), None).unwrap();
+        assert_eq!(model, "gpt-4o");
+        assert_eq!(tokens.get("total_tokens").unwrap(), &3);
+    }
+
+    #[test]
+    fn stream_flag_detected_and_stream_options_injected() {
+        // Mirrors the logic in handle_request for streaming requests
+        fn prepare(body: &str) -> (bool, serde_json::Value) {
+            let parsed: Option<serde_json::Value> = serde_json::from_str(body).ok();
+            let is_stream = parsed
+                .as_ref()
+                .and_then(|v| v["stream"].as_bool())
+                .unwrap_or(false);
+            let mut out = parsed.clone().unwrap();
+            if is_stream && out.is_object() {
+                match out
+                    .get_mut("stream_options")
+                    .and_then(|o| o.as_object_mut())
+                {
+                    Some(o) => {
+                        o.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+                    }
+                    None => {
+                        out["stream_options"] = serde_json::json!({ "include_usage": true });
+                    }
+                }
+            }
+            (is_stream, out)
+        }
+
+        // Copilot-style streaming request
+        let (is_stream, out) = prepare(r#"{"model":"gpt-4o","stream":true}"#);
+        assert!(is_stream);
+        assert_eq!(
+            out["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
+
+        // Existing stream_options are preserved, include_usage added
+        let (is_stream, out) =
+            prepare(r#"{"model":"gpt-4o","stream":true,"stream_options":{"foo":1}}"#);
+        assert!(is_stream);
+        assert_eq!(out["stream_options"]["foo"], serde_json::json!(1));
+        assert_eq!(
+            out["stream_options"]["include_usage"],
+            serde_json::json!(true)
+        );
+
+        // curl-style non-streaming request is untouched
+        let (is_stream, out) = prepare(r#"{"model":"gpt-4o","temperature":0.7}"#);
+        assert!(!is_stream);
+        assert!(out.get("stream_options").is_none());
     }
 
     #[test]
