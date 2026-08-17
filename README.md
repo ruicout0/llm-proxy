@@ -231,6 +231,23 @@ llm-proxy usage --reset
 
 The store path defaults to `~/.config/llm-proxy/usage.json` and can be overridden with the `usage_store_path` config option.
 
+### Streaming requests
+
+Clients like GitHub Copilot Chat send `"stream": true`, so the upstream replies with a
+Server-Sent Events (SSE) stream instead of a single JSON object. The proxy handles this
+transparently:
+
+- Streaming responses are **forwarded chunk by chunk** and never buffered, so clients
+  render tokens in real time and requests do not stall.
+- For streaming requests the proxy injects `stream_options: {"include_usage": true}` into
+  the request body. Without it, OpenAI-compatible upstreams never emit token usage for
+  streams, and cost cannot be attributed.
+- Usage and cost are parsed from the final SSE chunk (the one carrying `usage`) once the
+  stream completes, and recorded under the same group/model as non-streaming requests.
+
+If an upstream ignores `stream_options.include_usage`, no usage chunk is emitted and the
+request is forwarded normally without cost attribution (a debug log line is emitted).
+
 ## Requirements
 
 - Rust 1.70+
