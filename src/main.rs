@@ -5,23 +5,22 @@ pub mod discovery;
 pub mod pricing;
 pub mod provider;
 pub mod proxy;
+pub mod service;
 pub mod router;
 pub mod usage;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use dirs::home_dir;
 use hyper::server::Server;
 use hyper::service::{make_service_fn, service_fn};
 use keyring::Entry;
-use plist::{Dictionary, Value as PlistValue};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{info, warn};
 
 use crate::config::{default_usage_store_path, ConfigFile, ProviderConfig};
+use crate::service::paths::default_config_path;
 use crate::discovery::DiscoveryCache;
 use crate::pricing::PricingRegistry;
 use crate::provider::KEYCHAIN_SERVICE;
@@ -136,7 +135,7 @@ struct InstallArgs {
     #[arg(short = 'p', long, default_value = "3128")]
     port: u16,
 
-    /// Use macOS Keychain for secrets (default: true)
+    /// Use system keyring / credential vault for secrets (default: true)
     #[arg(long, default_value = "true")]
     use_keychain: bool,
 }
@@ -145,35 +144,11 @@ struct InstallArgs {
 // Runtime & Service Helpers
 // ============================================================================
 
-const SERVICE_LABEL: &str = "com.user.llm-proxy";
 
-fn plist_path() -> Result<PathBuf> {
-    let home = home_dir().context("No home directory")?;
-    Ok(home
-        .join("Library/LaunchAgents")
-        .join(format!("{}.plist", SERVICE_LABEL)))
-}
 
-fn log_dir() -> Result<PathBuf> {
-    let home = home_dir().context("No home directory")?;
-    let dir = home.join("Library/Logs/llm-proxy");
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
-fn binary_path() -> Result<PathBuf> {
-    let current_exe = std::env::current_exe()?;
-    if current_exe.file_name().and_then(|s| s.to_str()) == Some("llm-proxy") {
-        Ok(current_exe)
-    } else {
-        let home = home_dir().context("No home directory")?;
-        Ok(home.join(".local/bin/llm-proxy"))
-    }
-}
 
 pub fn config_path() -> Result<PathBuf> {
-    let home = home_dir().context("No home directory")?;
-    Ok(home.join(".config/llm-proxy/config.toml"))
+    default_config_path()
 }
 
 pub fn load_config(path_override: Option<PathBuf>) -> Result<ConfigFile> {
@@ -210,7 +185,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         if let Some(ref secret) = args.client_secret {
             Entry::new(KEYCHAIN_SERVICE, &format!("{}:client_secret", default_prov_id))?.set_password(secret)?;
         }
-        info!("Stored secrets in macOS Keychain under namespace: {}", default_prov_id);
+        info!("Stored secrets in system keyring under namespace: {}", default_prov_id);
     }
 
     let prov = ProviderConfig {
@@ -265,131 +240,53 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
     std::fs::write(&cfg_path, toml_str)?;
     info!("Wrote config file: {}", cfg_path.display());
 
-    let bin_path = binary_path()?;
-    let log_dir = log_dir()?;
-    let out_log = log_dir.join("stdout.log");
-    let err_log = log_dir.join("stderr.log");
-
-    let mut env_dict = Dictionary::new();
-    env_dict.insert(
-        "LLM_PROXY_CONFIG".to_string(),
-        PlistValue::String(cfg_path.to_string_lossy().to_string()),
-    );
-    env_dict.insert(
-        "RUST_LOG".to_string(),
-        PlistValue::String("info".to_string()),
-    );
-
-    let mut plist = Dictionary::new();
-    plist.insert("Label".to_string(), PlistValue::String(SERVICE_LABEL.to_string()));
-    plist.insert(
-        "ProgramArguments".to_string(),
-        PlistValue::Array(vec![
-            PlistValue::String(bin_path.to_string_lossy().to_string()),
-            PlistValue::String("run".to_string()),
-        ]),
-    );
-    plist.insert("RunAtLoad".to_string(), PlistValue::Boolean(true));
-    plist.insert("KeepAlive".to_string(), PlistValue::Boolean(true));
-    plist.insert(
-        "StandardOutPath".to_string(),
-        PlistValue::String(out_log.to_string_lossy().to_string()),
-    );
-    plist.insert(
-        "StandardErrorPath".to_string(),
-        PlistValue::String(err_log.to_string_lossy().to_string()),
-    );
-    plist.insert("EnvironmentVariables".to_string(), PlistValue::Dictionary(env_dict));
-    plist.insert(
-        "WorkingDirectory".to_string(),
-        PlistValue::String(home_dir().context("No home directory")?.to_string_lossy().to_string()),
-    );
-
-    let path = plist_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let mut env_vars = std::collections::HashMap::new();
+    env_vars.insert("LLM_PROXY_CONFIG".to_string(), cfg_path.to_string_lossy().to_string());
+    env_vars.insert("RUST_LOG".to_string(), "info".to_string());
+    if let Ok(proxy) = std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("https_proxy")) {
+        env_vars.insert("https_proxy".to_string(), proxy.clone());
+        env_vars.insert("HTTPS_PROXY".to_string(), proxy);
     }
-    plist::Value::Dictionary(plist).to_file_xml(&path)?;
-
-    info!("Installed launchd service: {}", path.display());
-    info!("Config: {}", cfg_path.display());
-    info!("Logs: {}", log_dir.display());
-    info!("Run 'llm-proxy start' to start the service");
-    Ok(())
-}
-
-fn run_launchctl(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("launchctl").args(args).output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("launchctl failed: {}", stderr);
+    if let Ok(proxy) = std::env::var("HTTP_PROXY").or_else(|_| std::env::var("http_proxy")) {
+        env_vars.insert("http_proxy".to_string(), proxy.clone());
+        env_vars.insert("HTTP_PROXY".to_string(), proxy);
     }
+    if let Ok(no_proxy) = std::env::var("NO_PROXY").or_else(|_| std::env::var("no_proxy")) {
+        env_vars.insert("no_proxy".to_string(), no_proxy.clone());
+        env_vars.insert("NO_PROXY".to_string(), no_proxy);
+    }
+
+    service::install(&cfg_path, env_vars)?;
     Ok(())
 }
 
 fn start_service() -> Result<()> {
-    run_launchctl(&["load", "-w", plist_path()?.to_str().unwrap()])?;
-    info!("Service started");
-    Ok(())
+    service::start()
 }
 
 fn stop_service() -> Result<()> {
-    let _ = run_launchctl(&["unload", "-w", plist_path()?.to_str().unwrap()]);
-    info!("Service stopped");
-    Ok(())
+    service::stop()
 }
 
 fn restart_service() -> Result<()> {
-    stop_service()?;
-    std::thread::sleep(Duration::from_secs(1));
-    start_service()?;
-    Ok(())
+    service::restart()
 }
 
 fn status_service() -> Result<()> {
-    let output = std::process::Command::new("launchctl")
-        .args(["list", SERVICE_LABEL])
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains(SERVICE_LABEL) {
-        info!("Service is LOADED");
-        println!("{}", stdout);
-    } else {
-        info!("Service is NOT loaded");
-    }
-    Ok(())
+    service::status()
 }
 
 fn logs_service() -> Result<()> {
-    let log_dir = log_dir()?;
-    let out_log = log_dir.join("stdout.log");
-    let err_log = log_dir.join("stderr.log");
-
-    println!("Following logs (Ctrl+C to stop)...");
-    println!("  stdout: {}", out_log.display());
-    println!("  stderr: {}", err_log.display());
-
-    let mut child = std::process::Command::new("tail")
-        .args(["-f", out_log.to_str().unwrap(), err_log.to_str().unwrap()])
-        .spawn()?;
-    child.wait()?;
-    Ok(())
+    service::logs()
 }
 
 fn uninstall_service() -> Result<()> {
-    let _ = stop_service();
-    let path = plist_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path)?;
-        info!("Removed plist: {}", path.display());
-    }
-
+    service::uninstall()?;
     let cfg_path = config_path()?;
     if cfg_path.exists() {
         std::fs::remove_file(&cfg_path)?;
         info!("Removed config: {}", cfg_path.display());
     }
-
     info!("Service uninstalled");
     Ok(())
 }
