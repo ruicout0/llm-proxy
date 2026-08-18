@@ -133,6 +133,8 @@ pub struct ConfigFile {
     pub insecure_skip_tls_verify: bool,
     #[serde(default)]
     pub usage_store_path: Option<String>,
+    #[serde(default)]
+    pub pricing_cache_path: Option<String>,
 
     // Multi-provider fields
     #[serde(default = "default_provider_id")]

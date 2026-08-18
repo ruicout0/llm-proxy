@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod discovery;
+pub mod pricing;
 pub mod provider;
 pub mod proxy;
 pub mod router;
@@ -22,6 +23,7 @@ use tracing::{info, warn};
 
 use crate::config::{default_usage_store_path, ConfigFile, ProviderConfig};
 use crate::discovery::DiscoveryCache;
+use crate::pricing::PricingRegistry;
 use crate::provider::KEYCHAIN_SERVICE;
 use crate::proxy::handle_request;
 use crate::router::Registry;
@@ -251,6 +253,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         ca_cert_path: None,
         insecure_skip_tls_verify: false,
         usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
+        pricing_cache_path: None,
         default_provider: default_prov_id,
         model_separator: '/',
         discovery_ttl_secs: 300,
@@ -414,6 +417,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
+        pricing_cache_path: None,
                 default_provider: "bmw".to_string(),
                 model_separator: '/',
                 discovery_ttl_secs: 300,
@@ -434,6 +438,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
             ca_cert_path: None,
             insecure_skip_tls_verify: false,
             usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
+        pricing_cache_path: None,
             default_provider: "bmw".to_string(),
             model_separator: '/',
             discovery_ttl_secs: 300,
@@ -703,6 +708,9 @@ async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<
                 for (currency, amount) in &model_usage.cost {
                     println!("    cost {}: {:.10}", currency, amount);
                 }
+                for (currency, amount) in &model_usage.cost_estimated {
+                    println!("    cost (estimated) {}: {:.10}", currency, amount);
+                }
                 for (token_type, count) in &model_usage.tokens {
                     println!("    {}: {}", token_type, count);
                 }
@@ -791,6 +799,7 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     let config = load_config(config_file)?;
     let registry = Arc::new(Registry::new(&config));
     let discovery = Arc::new(DiscoveryCache::new(&config));
+    let pricing = Arc::new(PricingRegistry::new(&config));
 
     let usage_store_path = config
         .usage_store_path
@@ -798,6 +807,26 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(default_usage_store_path);
     let usage_store = Arc::new(UsageStore::new(usage_store_path));
+
+    // Warm pricing catalog in background on startup and periodically (every 24h)
+    {
+        let pr = pricing.clone();
+        tokio::spawn(async move {
+            info!("Fetching latest LLM pricing catalog...");
+            if let Err(e) = pr.fetch_latest().await {
+                warn!("Pricing catalog sync encountered errors (will use cache/fallback): {}", e);
+            }
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86400));
+            interval.tick().await; // skip initial tick
+            loop {
+                interval.tick().await;
+                info!("Scheduled refresh of LLM pricing catalog...");
+                if let Err(e) = pr.fetch_latest().await {
+                    warn!("Scheduled pricing catalog sync failed: {}", e);
+                }
+            }
+        });
+    }
 
     // Warm discovery in background on startup
     {
@@ -820,13 +849,15 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     let make_svc = make_service_fn(move |_| {
         let registry = registry.clone();
         let discovery = discovery.clone();
+        let pricing = pricing.clone();
         let usage_store = usage_store.clone();
         async move {
             Ok::<_, anyhow::Error>(service_fn(move |req| {
                 let registry = registry.clone();
                 let discovery = discovery.clone();
+                let pricing = pricing.clone();
                 let usage_store = usage_store.clone();
-                async move { handle_request(req, registry, discovery, usage_store).await }
+                async move { handle_request(req, registry, discovery, pricing, usage_store).await }
             }))
         }
     });
@@ -1419,8 +1450,28 @@ api_key = "openai-key"
         assert!(std::path::Path::new(&bak_path).exists());
     }
 
-    #[test]
-    fn cost_estimation_math() {
+    #[tokio::test]
+    async fn cost_estimation_math() {
+        let dummy_cfg = ConfigFile {
+            llm_host: None,
+            listen_port: 3128,
+            api_key: None,
+            token_endpoint: None,
+            client_id: None,
+            client_secret: None,
+            oauth_scope: None,
+            bearer_token: None,
+            ca_cert_path: None,
+            insecure_skip_tls_verify: false,
+            usage_store_path: None,
+            pricing_cache_path: None,
+            default_provider: "openai".to_string(),
+            model_separator: '/',
+            discovery_ttl_secs: 300,
+            discovery_timeout_ms: 2500,
+            providers: vec![],
+        };
+        let pricing = PricingRegistry::new(&dummy_cfg);
         let p_cfg = ProviderConfig {
             id: "openai".to_string(),
             base_url: "api.openai.com".to_string(),
@@ -1458,7 +1509,7 @@ api_key = "openai-key"
         tokens.insert("prompt_tokens".to_string(), 1_000_000_u64);
         tokens.insert("completion_tokens".to_string(), 500_000_u64);
 
-        let (est_cost, currency) = estimate_cost(&tokens, &prov, "openai/gpt-4o").unwrap();
+        let (est_cost, currency) = estimate_cost(&tokens, &prov, "openai/gpt-4o", &pricing).await.unwrap();
         assert_eq!(currency, "USD");
         assert_eq!(est_cost, 2.50 + 5.00); // 2.50 + 5.00 = 7.50
     }

@@ -266,22 +266,44 @@ impl DiscoveryCache {
     }
 }
 
-async fn fetch_provider_models(prov: &Provider) -> Result<Vec<OpenAiModel>> {
-    let mut uri_str = format!("{}://{}/v1/models", prov.scheme, prov.base_url.trim_end_matches('/'));
-    if prov.base_url.contains("/v1") {
-        uri_str = format!("{}://{}/models", prov.scheme, prov.base_url.trim_end_matches('/'));
-    }
+pub async fn fetch_provider_models(prov: &Provider) -> Result<Vec<OpenAiModel>> {
+    let base = prov.base_url.trim_end_matches('/');
+    let uri_str = if base.ends_with("/v1") || base.ends_with("/openai") || base.contains("/v1/") || base.contains("/openai/") {
+        format!("{}://{}/models", prov.scheme, base)
+    } else {
+        format!("{}://{}/v1/models", prov.scheme, base)
+    };
 
     let mut req_builder = Request::builder().method(Method::GET).uri(uri_str);
 
-    let bearer = prov.token_cache.get_valid_bearer().await.unwrap_or_default();
-    let x_api_key = prov.token_cache.get_x_api_key().await.unwrap_or_default();
-
-    if !bearer.is_empty() {
-        req_builder = req_builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", bearer));
-    }
-    if !x_api_key.is_empty() {
-        req_builder = req_builder.header("x-apikey", x_api_key);
+    match &prov.auth {
+        crate::provider::AuthStyle::OauthM2m { .. } => {
+            let bearer = prov.token_cache.get_valid_bearer().await.unwrap_or_default();
+            let x_api_key = prov.token_cache.get_x_api_key().await.unwrap_or_default();
+            if !bearer.is_empty() {
+                req_builder = req_builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", bearer));
+            }
+            if !x_api_key.is_empty() {
+                req_builder = req_builder.header("x-apikey", x_api_key);
+            }
+        }
+        crate::provider::AuthStyle::BearerApiKey { .. } | crate::provider::AuthStyle::StaticBearer { .. } => {
+            let bearer = prov.token_cache.get_valid_bearer().await.unwrap_or_default();
+            let x_api_key = prov.token_cache.get_x_api_key().await.unwrap_or_default();
+            if !bearer.is_empty() {
+                req_builder = req_builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", bearer));
+            }
+            if !x_api_key.is_empty() {
+                req_builder = req_builder.header("x-apikey", x_api_key);
+            }
+        }
+        crate::provider::AuthStyle::CustomHeader { name, .. } => {
+            let val = prov.token_cache.get_x_api_key().await.unwrap_or_default();
+            if !val.is_empty() {
+                req_builder = req_builder.header(name.as_str(), val);
+            }
+        }
+        crate::provider::AuthStyle::None => {}
     }
 
     let host_only = prov.base_url.split('/').next().unwrap_or(&prov.base_url);

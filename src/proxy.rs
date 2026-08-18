@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{debug, error, warn};
 
 use crate::discovery::DiscoveryCache;
+use crate::pricing::PricingRegistry;
 use crate::provider::{AuthStyle, Provider};
 use crate::router::Registry;
 use crate::usage::{
@@ -52,6 +53,7 @@ pub async fn handle_request(
     req: Request<Body>,
     registry: Arc<Registry>,
     discovery: Arc<DiscoveryCache>,
+    pricing: Arc<PricingRegistry>,
     usage_store: Arc<UsageStore>,
 ) -> Result<Response<Body>> {
     let method = req.method().clone();
@@ -354,6 +356,7 @@ pub async fn handle_request(
                         record_usage_from_response(
                             retry_resp,
                             usage_store.clone(),
+                            pricing.clone(),
                             group,
                             provider.id.clone(),
                             canonical_model,
@@ -381,6 +384,7 @@ pub async fn handle_request(
                 record_usage_from_response(
                     resp,
                     usage_store.clone(),
+                    pricing.clone(),
                     group,
                     provider.id.clone(),
                     canonical_model,
@@ -471,6 +475,7 @@ pub fn parse_sse_usage(buf: &[u8], request_model: Option<&str>) -> Option<Parsed
 pub async fn record_usage_from_response(
     resp: Response<Body>,
     usage_store: Arc<UsageStore>,
+    pricing: Arc<PricingRegistry>,
     group: String,
     provider_id: String,
     canonical_model: String,
@@ -485,6 +490,7 @@ pub async fn record_usage_from_response(
             body: Body,
             buf: Vec<u8>,
             usage_store: Arc<UsageStore>,
+            pricing: Arc<PricingRegistry>,
             group: String,
             provider_id: String,
             canonical_model: String,
@@ -495,6 +501,7 @@ pub async fn record_usage_from_response(
             body,
             buf: Vec::new(),
             usage_store,
+            pricing: pricing.clone(),
             group,
             provider_id,
             canonical_model,
@@ -513,7 +520,11 @@ pub async fn record_usage_from_response(
                         if let Some((_model, cost_reported, tokens)) =
                             parse_sse_usage(&state.buf, Some(&state.canonical_model))
                         {
-                            let cost_estimated = estimate_cost(&tokens, &state.provider, &state.canonical_model);
+                            let cost_estimated = if cost_reported.is_none() {
+                                estimate_cost(&tokens, &state.provider, &state.canonical_model, &state.pricing).await
+                            } else {
+                                None
+                            };
                             debug!(
                                 "Recorded streaming usage for group={} prov={} model={} reported={:?} estimated={:?}",
                                 state.group, state.provider_id, state.canonical_model, cost_reported, cost_estimated
@@ -555,7 +566,11 @@ pub async fn record_usage_from_response(
                 }
             }
 
-            let cost_estimated = estimate_cost(&tokens, &provider, &canonical_model);
+            let cost_estimated = if cost_reported.is_none() {
+                estimate_cost(&tokens, &provider, &canonical_model, &pricing).await
+            } else {
+                None
+            };
             let _ = usage_store
                 .record_with_provider(
                     &group,
@@ -572,20 +587,31 @@ pub async fn record_usage_from_response(
     Ok(Response::from_parts(parts, Body::from(body_bytes)))
 }
 
-pub fn estimate_cost(
+pub async fn estimate_cost(
     tokens: &BTreeMap<String, u64>,
     provider: &Provider,
     canonical_model: &str,
+    pricing: &PricingRegistry,
 ) -> Option<(f64, String)> {
-    // Look up model pricing spec
     let upstream_key = canonical_model
         .split_once('/')
         .map(|(_, up)| up)
         .unwrap_or(canonical_model);
 
-    let spec = provider.models.get(upstream_key)?;
-    let in_rate = spec.input_cost_per_1m?;
-    let out_rate = spec.output_cost_per_1m?;
+    // 1. Try explicit provider model spec from config
+    let (in_rate, out_rate, currency) = if let Some(spec) = provider.models.get(upstream_key) {
+        if let (Some(in_r), Some(out_r)) = (spec.input_cost_per_1m, spec.output_cost_per_1m) {
+            (in_r, out_r, spec.currency.clone())
+        } else if let Some(dynamic) = pricing.lookup_rate(canonical_model).await {
+            dynamic
+        } else {
+            return None;
+        }
+    } else if let Some(dynamic) = pricing.lookup_rate(canonical_model).await {
+        dynamic
+    } else {
+        return None;
+    };
 
     let prompt_tokens = tokens.get("prompt_tokens").copied().unwrap_or(0);
     let completion_tokens = tokens.get("completion_tokens").copied().unwrap_or(0);
@@ -593,5 +619,5 @@ pub fn estimate_cost(
     let cost = (prompt_tokens as f64 / 1_000_000.0) * in_rate
         + (completion_tokens as f64 / 1_000_000.0) * out_rate;
 
-    Some((cost, spec.currency.clone()))
+    Some((cost, currency))
 }
