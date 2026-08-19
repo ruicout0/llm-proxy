@@ -99,6 +99,18 @@ pub async fn handle_request(
             .body(Body::from(body))?);
     }
     if method == Method::GET && path_and_query.starts_with("/llm-proxy/health") {
+        let uri = req.uri();
+        let query = uri.query().unwrap_or("");
+        let refresh_requested = query
+            .split('&')
+            .any(|pair| pair == "refresh=true" || pair == "refresh=1" || pair == "refresh");
+        if refresh_requested {
+            for prov in registry.providers.values() {
+                prov.token_cache.clear_token().await;
+            }
+            let _ = discovery.refresh(&registry).await;
+        }
+
         let mut health_map = BTreeMap::new();
         for (id, prov) in &registry.providers {
             let h = prov.health.read().await;
