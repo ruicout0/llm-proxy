@@ -744,77 +744,28 @@ impl TokenCache {
         #[cfg(target_os = "macos")]
         {
             let prof_text = profile.unwrap_or("default");
-            let sso_url = Self::resolve_sso_start_url(profile)
-                .unwrap_or_else(|| "https://aws.amazon.com".to_string());
+            let aws_cmd = if prof_text == "default" {
+                "aws sso login".to_string()
+            } else {
+                format!("aws sso login --profile {}", prof_text)
+            };
             let script = format!(
-                "try\n                 set chosen to button returned of (display alert \"llm-proxy: AWS SSO Expired\" message \"AWS SSO session expired for profile '{prof}'. Click 'Open SSO Portal' to authenticate in your browser or run 'aws sso login --profile {prof}' in Terminal.\" buttons {{\"Dismiss\", \"Open SSO Portal\"}} default button 2 giving up after 45)\n                 if chosen is \"Open SSO Portal\" then\n                     open location \"{url}\"\n                 end if\n                 end try",
-                prof = prof_text,
-                url = sso_url
+                r#"try
+set chosen to button returned of (display alert "llm-proxy: AWS SSO Expired" message "AWS SSO session expired for profile \"{}\". Click 'Login with AWS SSO' to authenticate." buttons {{"Dismiss", "Login with AWS SSO"}} default button 2 giving up after 45)
+if chosen is "Login with AWS SSO" then
+    tell application "Terminal"
+        do script "{}"
+        activate
+    end tell
+end if
+end try"#,
+                prof_text, aws_cmd
             );
             let _ = std::process::Command::new("osascript")
                 .arg("-e")
                 .arg(script)
                 .spawn();
         }
-    }
-
-    fn resolve_sso_start_url(profile: Option<&str>) -> Option<String> {
-        let home = dirs::home_dir()?;
-        let cfg_path = home.join(".aws/config");
-        let content = std::fs::read_to_string(cfg_path).ok()?;
-        let target_profile = profile.unwrap_or("default");
-
-        let mut in_target_section = false;
-        let mut sso_start_url = None;
-        let mut sso_session_name = None;
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.starts_with('[') && line.ends_with(']') {
-                let sec = &line[1..line.len() - 1];
-                let sec_name = sec.strip_prefix("profile ").unwrap_or(sec);
-                in_target_section = sec_name == target_profile;
-                continue;
-            }
-            if in_target_section {
-                if let Some((k, v)) = line.split_once('=') {
-                    let k = k.trim().to_ascii_lowercase();
-                    let v = v.trim().to_string();
-                    if k == "sso_start_url" {
-                        sso_start_url = Some(v);
-                    } else if k == "sso_session" {
-                        sso_session_name = Some(v);
-                    }
-                }
-            }
-        }
-
-        if let Some(url) = sso_start_url {
-            return Some(url);
-        }
-
-        // If profile links to sso-session, find sso_start_url in [sso-session <name>]
-        if let Some(session_name) = sso_session_name {
-            let mut in_session_section = false;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.starts_with('[') && line.ends_with(']') {
-                    let sec = &line[1..line.len() - 1];
-                    let sec_name = sec.strip_prefix("sso-session ").unwrap_or(sec);
-                    in_session_section = sec_name == session_name;
-                    continue;
-                }
-                if in_session_section {
-                    if let Some((k, v)) = line.split_once('=') {
-                        if k.trim().eq_ignore_ascii_case("sso_start_url") {
-                            return Some(v.trim().to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        None
     }
 
     fn load_from_aws_credentials_file(profile: Option<&str>) -> Option<AwsCredentials> {
