@@ -16,9 +16,11 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::config::{AuthStyleConfig, ModelSpec, ProviderConfig};
+use crate::config::{AuthStyleConfig, DialectConfig, ModelSpec, ProviderConfig};
+use crate::dialect::Dialect;
+use crate::sigv4::AwsCredentials;
 
 pub const KEYCHAIN_SERVICE: &str = "llm-proxy";
 
@@ -36,11 +38,6 @@ impl rustls::client::ServerCertVerifier for NoopVerifier {
     ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::ServerCertVerified::assertion())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Dialect {
-    OpenAiCompatible,
 }
 
 #[derive(Debug, Clone)]
@@ -68,6 +65,16 @@ pub enum AuthStyle {
         name: String,
         value_ref: Option<String>,
         value: Option<String>,
+    },
+    AwsSigv4 {
+        region: String,
+        access_key_id_ref: Option<String>,
+        access_key_id: Option<String>,
+        secret_access_key_ref: Option<String>,
+        secret_access_key: Option<String>,
+        session_token_ref: Option<String>,
+        session_token: Option<String>,
+        profile: Option<String>,
     },
     None,
 }
@@ -134,16 +141,30 @@ impl Provider {
             models.insert(m.id.clone(), m.clone());
         }
 
+        let dialect = match cfg.dialect {
+            Some(DialectConfig::BedrockConverse) => Dialect::BedrockConverse,
+            Some(DialectConfig::OpenaiCompatible) => Dialect::OpenAiCompatible,
+            None => {
+                if matches!(cfg.auth_style, Some(AuthStyleConfig::AwsSigv4))
+                    || cfg.base_url.contains("bedrock")
+                {
+                    Dialect::BedrockConverse
+                } else {
+                    Dialect::OpenAiCompatible
+                }
+            }
+        };
+
         let auth = match cfg.auth_style {
             Some(AuthStyleConfig::OauthM2m) => {
-                let url = cfg
-                    .m2m_oauth_url
-                    .clone()
-                    .context(format!("Provider {}: m2m_oauth_url required for oauth_m2m", cfg.id))?;
-                let client_id = cfg
-                    .client_id
-                    .clone()
-                    .context(format!("Provider {}: client_id required for oauth_m2m", cfg.id))?;
+                let url = cfg.m2m_oauth_url.clone().context(format!(
+                    "Provider {}: m2m_oauth_url required for oauth_m2m",
+                    cfg.id
+                ))?;
+                let client_id = cfg.client_id.clone().context(format!(
+                    "Provider {}: client_id required for oauth_m2m",
+                    cfg.id
+                ))?;
                 AuthStyle::OauthM2m {
                     url,
                     client_id,
@@ -165,14 +186,30 @@ impl Provider {
                 api_key: cfg.api_key.clone(),
             },
             Some(AuthStyleConfig::CustomHeader) => {
-                let name = cfg
-                    .header_name
-                    .clone()
-                    .context(format!("Provider {}: header_name required for custom_header", cfg.id))?;
+                let name = cfg.header_name.clone().context(format!(
+                    "Provider {}: header_name required for custom_header",
+                    cfg.id
+                ))?;
                 AuthStyle::CustomHeader {
                     name,
                     value_ref: cfg.header_value_ref.clone(),
                     value: cfg.header_value.clone(),
+                }
+            }
+            Some(AuthStyleConfig::AwsSigv4) => {
+                let region = cfg
+                    .aws_region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_string());
+                AuthStyle::AwsSigv4 {
+                    region,
+                    access_key_id_ref: cfg.aws_access_key_id_ref.clone(),
+                    access_key_id: cfg.aws_access_key_id.clone(),
+                    secret_access_key_ref: cfg.aws_secret_access_key_ref.clone(),
+                    secret_access_key: cfg.aws_secret_access_key.clone(),
+                    session_token_ref: cfg.aws_session_token_ref.clone(),
+                    session_token: cfg.aws_session_token.clone(),
+                    profile: cfg.aws_profile.clone(),
                 }
             }
             Some(AuthStyleConfig::None) => AuthStyle::None,
@@ -208,14 +245,18 @@ impl Provider {
         };
 
         let client = build_http_client(cfg.insecure_skip_tls_verify, cfg.ca_cert_path.as_deref())?;
-        let token_cache = Arc::new(TokenCache::new(cfg.id.clone(), auth.clone(), client.clone()));
+        let token_cache = Arc::new(TokenCache::new(
+            cfg.id.clone(),
+            auth.clone(),
+            client.clone(),
+        ));
 
         Ok(Self {
             id: cfg.id.clone(),
             base_url: cfg.base_url.clone(),
             scheme,
             auth,
-            dialect: Dialect::OpenAiCompatible,
+            dialect,
             client,
             token_cache,
             models,
@@ -238,10 +279,19 @@ impl Provider {
             h.is_failed = true;
         }
     }
+
+    pub async fn record_discovery_failure(&self, reason: String) {
+        let mut h = self.health.write().await;
+        h.last_failure = Some((Instant::now(), format!("Discovery: {}", reason)));
+        h.discovery = DiscoveryState::Failed(reason);
+        h.is_failed = true;
+    }
 }
 
 pub fn should_bypass_proxy(host: &str) -> bool {
-    let no_proxy_env = std::env::var("NO_PROXY").or_else(|_| std::env::var("no_proxy")).unwrap_or_default();
+    let no_proxy_env = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
     if no_proxy_env.trim() == "*" {
         return true;
     }
@@ -303,6 +353,7 @@ impl ProxyConnector {
 
 pub struct MaybeProxiedStream {
     stream: TcpStream,
+    buffer: std::io::Cursor<Vec<u8>>,
 }
 
 impl AsyncRead for MaybeProxiedStream {
@@ -311,10 +362,17 @@ impl AsyncRead for MaybeProxiedStream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        if (self.buffer.position() as usize) < self.buffer.get_ref().len() {
+            let pos = self.buffer.position() as usize;
+            let slice = &self.buffer.get_ref()[pos..];
+            let to_read = std::cmp::min(buf.remaining(), slice.len());
+            buf.put_slice(&slice[..to_read]);
+            self.buffer.set_position((pos + to_read) as u64);
+            return Poll::Ready(Ok(()));
+        }
         Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
-
 impl AsyncWrite for MaybeProxiedStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -328,7 +386,10 @@ impl AsyncWrite for MaybeProxiedStream {
         Pin::new(&mut self.stream).poll_flush(cx)
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
@@ -350,21 +411,30 @@ impl Service<Uri> for ProxyConnector {
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         let host = dst.host().unwrap_or_default().to_string();
-        let port = dst.port_u16().unwrap_or(if dst.scheme_str() == Some("http") { 80 } else { 443 });
+        let port = dst
+            .port_u16()
+            .unwrap_or(if dst.scheme_str() == Some("http") {
+                80
+            } else {
+                443
+            });
         let proxy_url = get_outbound_proxy_url();
         let should_bypass = should_bypass_proxy(&host);
 
         Box::pin(async move {
             if let (Some(proxy), false) = (proxy_url, should_bypass) {
                 let proxy_uri: Uri = proxy.parse().map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("Invalid proxy URL: {}", e))
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Invalid proxy URL: {}", e),
+                    )
                 })?;
                 let p_host = proxy_uri.host().unwrap_or("127.0.0.1").to_string();
                 let p_port = proxy_uri.port_u16().unwrap_or(3128);
 
                 let mut stream = TcpStream::connect((p_host.as_str(), p_port)).await?;
 
-                                let connect_req = format!(
+                let connect_req = format!(
                     "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\nProxy-Connection: Keep-Alive\r\n\r\n",
                     host, port, host, port
                 );
@@ -383,18 +453,27 @@ impl Service<Uri> for ProxyConnector {
                     pos += n;
                     if let Some(idx) = buf[..pos].windows(4).position(|w| w == b"\r\n\r\n") {
                         let header_part = String::from_utf8_lossy(&buf[..idx]);
-                        if !header_part.starts_with("HTTP/1.1 200") && !header_part.starts_with("HTTP/1.0 200") {
-                            return Err(std::io::Error::other(
-                                format!("Proxy CONNECT failed: {}", header_part.lines().next().unwrap_or("")),
-                            ));
+                        if !header_part.starts_with("HTTP/1.1 200")
+                            && !header_part.starts_with("HTTP/1.0 200")
+                        {
+                            return Err(std::io::Error::other(format!(
+                                "Proxy CONNECT failed: {}",
+                                header_part.lines().next().unwrap_or("")
+                            )));
                         }
-                        break;
+                        let leftover = buf[idx + 4..pos].to_vec();
+                        return Ok(MaybeProxiedStream {
+                            stream,
+                            buffer: std::io::Cursor::new(leftover),
+                        });
                     }
                 }
-                Ok(MaybeProxiedStream { stream })
             } else {
                 let stream = TcpStream::connect((host.as_str(), port)).await?;
-                Ok(MaybeProxiedStream { stream })
+                Ok(MaybeProxiedStream {
+                    stream,
+                    buffer: std::io::Cursor::new(Vec::new()),
+                })
             }
         })
     }
@@ -454,32 +533,331 @@ fn build_http_client(
         .build(https))
 }
 
+pub struct CachedAwsCreds {
+    pub credentials: AwsCredentials,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 pub struct TokenCache {
     pub provider_id: String,
     pub auth: AuthStyle,
     pub client: Client<HttpsConnector<ProxyConnector>>,
     bearer_token: RwLock<Option<(String, Instant)>>,
     x_api_key: RwLock<Option<String>>,
+    aws_creds: RwLock<Option<CachedAwsCreds>>,
 }
 
 impl TokenCache {
-    pub fn new(provider_id: String, auth: AuthStyle, client: Client<HttpsConnector<ProxyConnector>>) -> Self {
+    pub fn new(
+        provider_id: String,
+        auth: AuthStyle,
+        client: Client<HttpsConnector<ProxyConnector>>,
+    ) -> Self {
         Self {
             provider_id,
             auth,
             client,
             bearer_token: RwLock::new(None),
             x_api_key: RwLock::new(None),
+            aws_creds: RwLock::new(None),
         }
     }
 
     pub async fn clear_token(&self) {
         *self.bearer_token.write().await = None;
+        *self.aws_creds.write().await = None;
     }
 
     pub fn invalidate(&self) {
         if let Ok(mut lock) = self.bearer_token.try_write() {
             *lock = None;
+        }
+    }
+
+    pub async fn get_aws_credentials(&self) -> Result<AwsCredentials> {
+        match &self.auth {
+            AuthStyle::AwsSigv4 {
+                access_key_id_ref,
+                access_key_id,
+                secret_access_key_ref,
+                secret_access_key,
+                session_token_ref,
+                session_token,
+                profile,
+                ..
+            } => {
+                // Check in-memory cached credentials with 5-minute expiry buffer
+                {
+                    let read_guard = self.aws_creds.read().await;
+                    if let Some(ref cached) = *read_guard {
+                        let now = chrono::Utc::now();
+                        let is_valid = match cached.expires_at {
+                            Some(exp) => exp > now + chrono::Duration::minutes(5),
+                            None => true,
+                        };
+                        if is_valid {
+                            return Ok(cached.credentials.clone());
+                        }
+                    }
+                }
+
+                // 1. Try dynamic AWS CLI export-credentials (handles AWS SSO auto-refresh)
+                match Self::export_credentials_via_aws_cli(profile.as_deref()) {
+                    Ok(cached) => {
+                        let creds = cached.credentials.clone();
+                        *self.aws_creds.write().await = Some(cached);
+                        return Ok(creds);
+                    }
+                    Err(e) => {
+                        debug!(
+                            "aws configure export-credentials skipped/failed for provider {}: {}",
+                            self.provider_id, e
+                        );
+                    }
+                }
+
+                // 2. Try config/keychain references or shell environment variables
+                let key_id = Self::resolve_secret(
+                    access_key_id_ref.as_deref(),
+                    access_key_id.as_deref(),
+                    "aws_access_key_id",
+                )
+                .or_else(|| std::env::var("AWS_ACCESS_KEY_ID").ok());
+
+                let secret = Self::resolve_secret(
+                    secret_access_key_ref.as_deref(),
+                    secret_access_key.as_deref(),
+                    "aws_secret_access_key",
+                )
+                .or_else(|| std::env::var("AWS_SECRET_ACCESS_KEY").ok());
+
+                let token = Self::resolve_secret(
+                    session_token_ref.as_deref(),
+                    session_token.as_deref(),
+                    "aws_session_token",
+                )
+                .or_else(|| std::env::var("AWS_SESSION_TOKEN").ok());
+
+                if let (Some(k), Some(s)) = (key_id, secret) {
+                    let creds = AwsCredentials {
+                        access_key_id: k,
+                        secret_access_key: s,
+                        session_token: token,
+                    };
+                    *self.aws_creds.write().await = Some(CachedAwsCreds {
+                        credentials: creds.clone(),
+                        expires_at: None,
+                    });
+                    return Ok(creds);
+                }
+
+                // 3. Try ~/.aws/credentials profile parser
+                if let Some(creds) = Self::load_from_aws_credentials_file(profile.as_deref()) {
+                    *self.aws_creds.write().await = Some(CachedAwsCreds {
+                        credentials: creds.clone(),
+                        expires_at: None,
+                    });
+                    return Ok(creds);
+                }
+
+                Self::notify_sso_expired(profile.as_deref());
+                anyhow::bail!(
+                    "AWS SSO session or credentials expired for provider '{}'. Please run 'aws sso login{}' in your terminal.",
+                    self.provider_id,
+                    profile.as_deref().map(|p| format!(" --profile {}", p)).unwrap_or_default()
+                )
+            }
+            _ => anyhow::bail!("Provider is not configured for AWS SigV4 auth"),
+        }
+    }
+
+    fn find_aws_binary() -> std::path::PathBuf {
+        let candidates = [
+            "/opt/homebrew/bin/aws",
+            "/usr/local/bin/aws",
+            "/usr/bin/aws",
+        ];
+        for c in candidates {
+            let p = std::path::PathBuf::from(c);
+            if p.exists() {
+                return p;
+            }
+        }
+        std::path::PathBuf::from("aws")
+    }
+
+    fn export_credentials_via_aws_cli(profile: Option<&str>) -> Result<CachedAwsCreds> {
+        let aws_bin = Self::find_aws_binary();
+        let mut cmd = std::process::Command::new(aws_bin);
+        cmd.arg("configure").arg("export-credentials");
+        if let Some(p) = profile {
+            if !p.is_empty() && p != "default" {
+                cmd.arg("--profile").arg(p);
+            }
+        }
+        // Remove standard proxy env vars so AWS CLI connects directly to local/AWS endpoint
+        cmd.env_remove("HTTP_PROXY")
+            .env_remove("HTTPS_PROXY")
+            .env_remove("http_proxy")
+            .env_remove("https_proxy");
+
+        let output = cmd.output().context("Failed to spawn aws CLI process")?;
+        if !output.status.success() {
+            let err_str = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "aws configure export-credentials failed: {}",
+                err_str.trim()
+            );
+        }
+
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .context("Invalid JSON returned by aws configure export-credentials")?;
+
+        let key_id = json["AccessKeyId"]
+            .as_str()
+            .context("Missing AccessKeyId in AWS CLI output")?
+            .to_string();
+
+        let secret = json["SecretAccessKey"]
+            .as_str()
+            .context("Missing SecretAccessKey in AWS CLI output")?
+            .to_string();
+
+        let token = json["SessionToken"].as_str().map(|s| s.to_string());
+
+        let expires_at = json["Expiration"]
+            .as_str()
+            .and_then(|exp_str| chrono::DateTime::parse_from_rfc3339(exp_str).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        Ok(CachedAwsCreds {
+            credentials: AwsCredentials {
+                access_key_id: key_id,
+                secret_access_key: secret,
+                session_token: token,
+            },
+            expires_at,
+        })
+    }
+
+    fn notify_sso_expired(profile: Option<&str>) {
+        #[cfg(target_os = "macos")]
+        {
+            let prof_text = profile.unwrap_or("default");
+            let sso_url = Self::resolve_sso_start_url(profile)
+                .unwrap_or_else(|| "https://aws.amazon.com".to_string());
+            let script = format!(
+                "try\n                 set chosen to button returned of (display alert \"llm-proxy: AWS SSO Expired\" message \"AWS SSO session expired for profile '{prof}'. Click 'Open SSO Portal' to authenticate in your browser or run 'aws sso login --profile {prof}' in Terminal.\" buttons {{\"Dismiss\", \"Open SSO Portal\"}} default button 2 giving up after 45)\n                 if chosen is \"Open SSO Portal\" then\n                     open location \"{url}\"\n                 end if\n                 end try",
+                prof = prof_text,
+                url = sso_url
+            );
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .spawn();
+        }
+    }
+
+    fn resolve_sso_start_url(profile: Option<&str>) -> Option<String> {
+        let home = dirs::home_dir()?;
+        let cfg_path = home.join(".aws/config");
+        let content = std::fs::read_to_string(cfg_path).ok()?;
+        let target_profile = profile.unwrap_or("default");
+
+        let mut in_target_section = false;
+        let mut sso_start_url = None;
+        let mut sso_session_name = None;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                let sec = &line[1..line.len() - 1];
+                let sec_name = sec.strip_prefix("profile ").unwrap_or(sec);
+                in_target_section = sec_name == target_profile;
+                continue;
+            }
+            if in_target_section {
+                if let Some((k, v)) = line.split_once('=') {
+                    let k = k.trim().to_ascii_lowercase();
+                    let v = v.trim().to_string();
+                    if k == "sso_start_url" {
+                        sso_start_url = Some(v);
+                    } else if k == "sso_session" {
+                        sso_session_name = Some(v);
+                    }
+                }
+            }
+        }
+
+        if let Some(url) = sso_start_url {
+            return Some(url);
+        }
+
+        // If profile links to sso-session, find sso_start_url in [sso-session <name>]
+        if let Some(session_name) = sso_session_name {
+            let mut in_session_section = false;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.starts_with('[') && line.ends_with(']') {
+                    let sec = &line[1..line.len() - 1];
+                    let sec_name = sec.strip_prefix("sso-session ").unwrap_or(sec);
+                    in_session_section = sec_name == session_name;
+                    continue;
+                }
+                if in_session_section {
+                    if let Some((k, v)) = line.split_once('=') {
+                        if k.trim().eq_ignore_ascii_case("sso_start_url") {
+                            return Some(v.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn load_from_aws_credentials_file(profile: Option<&str>) -> Option<AwsCredentials> {
+        let home = dirs::home_dir()?;
+        let creds_path = home.join(".aws/credentials");
+        let content = std::fs::read_to_string(creds_path).ok()?;
+        let target_profile = profile.unwrap_or("default");
+
+        let mut in_profile = false;
+        let mut key_id = None;
+        let mut secret = None;
+        let mut token = None;
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                let prof_name = &line[1..line.len() - 1];
+                in_profile = prof_name == target_profile;
+                continue;
+            }
+            if in_profile {
+                if let Some((k, v)) = line.split_once('=') {
+                    let k = k.trim().to_ascii_lowercase();
+                    let v = v.trim().to_string();
+                    if k == "aws_access_key_id" {
+                        key_id = Some(v);
+                    } else if k == "aws_secret_access_key" {
+                        secret = Some(v);
+                    } else if k == "aws_session_token" {
+                        token = Some(v);
+                    }
+                }
+            }
+        }
+
+        if let (Some(k), Some(s)) = (key_id, secret) {
+            Some(AwsCredentials {
+                access_key_id: k,
+                secret_access_key: s,
+                session_token: token,
+            })
+        } else {
+            None
         }
     }
 
@@ -505,34 +883,71 @@ impl TokenCache {
                 Ok(token)
             }
             AuthStyle::BearerApiKey { key_ref, api_key } => {
+                {
+                    let r = self.bearer_token.read().await;
+                    if let Some((tok, _)) = &*r {
+                        return Ok(tok.clone());
+                    }
+                }
+                let mut w = self.bearer_token.write().await;
+                if let Some((tok, _)) = &*w {
+                    return Ok(tok.clone());
+                }
                 let key = Self::resolve_secret(key_ref.as_deref(), api_key.as_deref(), "api_key")
                     .context(format!("Missing API key for provider {}", self.provider_id))?;
+                *w = Some((
+                    key.clone(),
+                    Instant::now() + Duration::from_secs(86400 * 365),
+                ));
                 Ok(key)
             }
-            AuthStyle::StaticBearer { token_ref, bearer_token, .. } => {
-                let token = Self::resolve_secret(token_ref.as_deref(), bearer_token.as_deref(), "bearer_token")
-                    .context(format!("Missing bearer token for provider {}", self.provider_id))?;
+            AuthStyle::StaticBearer {
+                token_ref,
+                bearer_token,
+                ..
+            } => {
+                let token = Self::resolve_secret(
+                    token_ref.as_deref(),
+                    bearer_token.as_deref(),
+                    "bearer_token",
+                )
+                .context(format!(
+                    "Missing bearer token for provider {}",
+                    self.provider_id
+                ))?;
                 Ok(token)
             }
-            AuthStyle::CustomHeader { .. } | AuthStyle::None => Ok("".to_string()),
+            AuthStyle::AwsSigv4 { .. } | AuthStyle::CustomHeader { .. } | AuthStyle::None => {
+                Ok("".to_string())
+            }
         }
     }
 
     pub async fn get_x_api_key(&self) -> Result<String> {
         match &self.auth {
-            AuthStyle::OauthM2m { api_key_ref, api_key, .. } => {
+            AuthStyle::OauthM2m {
+                api_key_ref,
+                api_key,
+                ..
+            } => {
                 let mut w = self.x_api_key.write().await;
                 if let Some(key) = &*w {
                     return Ok(key.clone());
                 }
-                let key = Self::resolve_secret(api_key_ref.as_deref(), api_key.as_deref(), "api_key")
-                    .unwrap_or_default();
+                let key =
+                    Self::resolve_secret(api_key_ref.as_deref(), api_key.as_deref(), "api_key")
+                        .unwrap_or_default();
                 *w = Some(key.clone());
                 Ok(key)
             }
-            AuthStyle::StaticBearer { api_key_ref, api_key, .. } => {
-                let key = Self::resolve_secret(api_key_ref.as_deref(), api_key.as_deref(), "x-api-key")
-                    .unwrap_or_default();
+            AuthStyle::StaticBearer {
+                api_key_ref,
+                api_key,
+                ..
+            } => {
+                let key =
+                    Self::resolve_secret(api_key_ref.as_deref(), api_key.as_deref(), "x-api-key")
+                        .unwrap_or_default();
                 Ok(key)
             }
             AuthStyle::BearerApiKey { key_ref, api_key } => {
@@ -540,12 +955,15 @@ impl TokenCache {
                     .unwrap_or_default();
                 Ok(key)
             }
-            AuthStyle::CustomHeader { value_ref, value, .. } => {
-                let v = Self::resolve_secret(value_ref.as_deref(), value.as_deref(), "header_value")
-                    .unwrap_or_default();
+            AuthStyle::CustomHeader {
+                value_ref, value, ..
+            } => {
+                let v =
+                    Self::resolve_secret(value_ref.as_deref(), value.as_deref(), "header_value")
+                        .unwrap_or_default();
                 Ok(v)
             }
-            AuthStyle::None => Ok("".to_string()),
+            AuthStyle::AwsSigv4 { .. } | AuthStyle::None => Ok("".to_string()),
         }
     }
 
@@ -564,7 +982,10 @@ impl TokenCache {
                     client_secret.as_deref(),
                     "client_secret",
                 )
-                .context(format!("Missing client secret for provider {}", self.provider_id))?;
+                .context(format!(
+                    "Missing client secret for provider {}",
+                    self.provider_id
+                ))?;
 
                 let mut params = vec![
                     ("grant_type", "client_credentials"),
@@ -610,7 +1031,11 @@ impl TokenCache {
         }
     }
 
-    fn resolve_secret(reference: Option<&str>, inline: Option<&str>, label: &str) -> Option<String> {
+    fn resolve_secret(
+        reference: Option<&str>,
+        inline: Option<&str>,
+        label: &str,
+    ) -> Option<String> {
         if let Some(r) = reference {
             if let Some(account) = r.strip_prefix("keychain:") {
                 match Entry::new(KEYCHAIN_SERVICE, account) {

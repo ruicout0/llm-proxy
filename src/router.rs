@@ -53,11 +53,17 @@ impl Registry {
         for (prov_id, prov) in &providers {
             for (m_id, spec) in &prov.models {
                 let canonical_id = format!("{}{}{}", prov_id, separator, m_id);
-                index.canonical.insert(canonical_id.clone(), (prov_id.clone(), m_id.clone()));
+                index
+                    .canonical
+                    .insert(canonical_id.clone(), (prov_id.clone(), m_id.clone()));
                 if let Some(ref alias) = spec.alias {
                     index.aliases.insert(alias.clone(), canonical_id.clone());
                 }
-                index.bare.entry(m_id.clone()).or_default().push(canonical_id);
+                index
+                    .bare
+                    .entry(m_id.clone())
+                    .or_default()
+                    .push(canonical_id);
             }
         }
 
@@ -86,7 +92,9 @@ impl Registry {
             Some(m) if !m.is_empty() => m,
             _ => {
                 // If no model specified, try default provider with empty/default upstream model
-                return self.route_for_provider(&self.default_provider, "default", "default").await;
+                return self
+                    .route_for_provider(&self.default_provider, "default", "default")
+                    .await;
             }
         };
 
@@ -156,7 +164,8 @@ impl Registry {
         }
 
         // Step 5: Fallback to default_provider
-        self.route_for_provider(&self.default_provider, req_model, req_model).await
+        self.route_for_provider(&self.default_provider, req_model, req_model)
+            .await
     }
 
     async fn route_for_provider(
@@ -168,7 +177,10 @@ impl Registry {
         if let Some(prov) = self.providers.get(prov_id) {
             let h = prov.health.read().await;
             if h.is_failed {
-                bail!("Default provider '{}' is currently unavailable/failed", prov_id);
+                bail!(
+                    "Default provider '{}' is currently unavailable/failed",
+                    prov_id
+                );
             }
             let canonical = format!("{}{}{}", prov_id, self.separator, model_name);
             Ok(Route {
@@ -177,7 +189,10 @@ impl Registry {
                 canonical_model: canonical,
             })
         } else {
-            bail!("Default provider '{}' is not configured or failed initialization", prov_id);
+            bail!(
+                "Default provider '{}' is not configured or failed initialization",
+                prov_id
+            );
         }
     }
 }

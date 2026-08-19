@@ -1,5 +1,6 @@
 use anyhow::Result;
 use bytes::Bytes;
+use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use hyper::body::to_bytes;
 use hyper::header::{HeaderValue, AUTHORIZATION, CACHE_CONTROL};
@@ -8,15 +9,22 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+use crate::dialect::{
+    resolve_bedrock_inference_profile_id, transform_bedrock_to_openai, transform_openai_to_bedrock,
+    Dialect, EventStreamDecoder,
+};
 use crate::discovery::DiscoveryCache;
 use crate::pricing::PricingRegistry;
 use crate::provider::{AuthStyle, Provider};
 use crate::router::Registry;
-use crate::usage::{
-    resolve_usage_group, TrafficClass, UsageStore,
-};
+use crate::sigv4::SigV4Signer;
+use crate::usage::{resolve_usage_group, TrafficClass, UsageStore};
 
-pub fn openai_error_response(status: StatusCode, message: &str, error_type: &str) -> Response<Body> {
+pub fn openai_error_response(
+    status: StatusCode,
+    message: &str,
+    error_type: &str,
+) -> Response<Body> {
     let error_json = serde_json::json!({
         "error": {
             "message": message,
@@ -95,7 +103,10 @@ pub async fn handle_request(
         for (id, prov) in &registry.providers {
             let h = prov.health.read().await;
             let last_success_sec = h.last_success.map(|i| i.elapsed().as_secs());
-            let last_failure_info = h.last_failure.as_ref().map(|(i, r)| (i.elapsed().as_secs(), r.clone()));
+            let last_failure_info = h
+                .last_failure
+                .as_ref()
+                .map(|(i, r)| (i.elapsed().as_secs(), r.clone()));
             health_map.insert(
                 id.clone(),
                 serde_json::json!({
@@ -201,7 +212,11 @@ pub async fn handle_request(
             } else {
                 StatusCode::BAD_REQUEST
             };
-            return Ok(openai_error_response(status, &err_msg, "invalid_request_error"));
+            return Ok(openai_error_response(
+                status,
+                &err_msg,
+                "invalid_request_error",
+            ));
         }
     };
 
@@ -209,37 +224,65 @@ pub async fn handle_request(
     let canonical_model = route.canonical_model.clone();
     let upstream_model = route.upstream_model.clone();
 
-    // 5. Rewrite body: strip model prefix and inject stream_options if streaming
-    if let Some(ref mut v) = parsed_body {
-        if v.is_object() {
-            // Strip prefix: set model to upstream_model
-            v["model"] = serde_json::Value::String(upstream_model.clone());
+    // 5. Dialect request translation
+    let (target_path_and_query, target_body_bytes) = if provider.dialect == Dialect::BedrockConverse
+    {
+        if let Some(ref val) = parsed_body {
+            let (m_id, bedrock_body) = transform_openai_to_bedrock(val)?;
+            let raw_model = if upstream_model.is_empty() {
+                m_id
+            } else {
+                upstream_model.clone()
+            };
+            let region = match &provider.auth {
+                AuthStyle::AwsSigv4 { region, .. } => region.as_str(),
+                _ => "eu-central-1",
+            };
+            let actual_model = resolve_bedrock_inference_profile_id(&raw_model, region);
+            let subpath = if is_stream {
+                "converse-stream"
+            } else {
+                "converse"
+            };
+            let path = format!("/model/{}/{}", actual_model, subpath);
+            let bytes = Bytes::from(serde_json::to_vec(&bedrock_body)?);
+            (path, bytes)
+        } else {
+            (path_and_query.clone(), body_bytes.clone())
+        }
+    } else {
+        // OpenAI standard rewriting: set model to upstream_model and inject stream_options
+        if let Some(ref mut v) = parsed_body {
+            if v.is_object() {
+                v["model"] = serde_json::Value::String(upstream_model.clone());
 
-            if is_stream {
-                let opts = v.get_mut("stream_options").and_then(|o| o.as_object_mut());
-                match opts {
-                    Some(o) => {
-                        o.insert("include_usage".to_string(), serde_json::Value::Bool(true));
-                    }
-                    None => {
-                        v["stream_options"] = serde_json::json!({ "include_usage": true });
+                if is_stream {
+                    let opts = v.get_mut("stream_options").and_then(|o| o.as_object_mut());
+                    match opts {
+                        Some(o) => {
+                            o.insert("include_usage".to_string(), serde_json::Value::Bool(true));
+                        }
+                        None => {
+                            v["stream_options"] = serde_json::json!({ "include_usage": true });
+                        }
                     }
                 }
-            }
-            if let Ok(new_bytes) = serde_json::to_vec(v) {
-                body_bytes = Bytes::from(new_bytes);
+                if let Ok(new_bytes) = serde_json::to_vec(v) {
+                    body_bytes = Bytes::from(new_bytes);
+                }
             }
         }
-    }
+        (path_and_query.clone(), body_bytes.clone())
+    };
 
     // 6. Build upstream URI
-    let upstream_uri_str = build_upstream_uri(&provider, &path_and_query)?;
+    let upstream_uri_str = build_upstream_uri(&provider, &target_path_and_query)?;
     let upstream_uri: hyper::Uri = upstream_uri_str.parse()?;
 
     // 7. Request forwarder closure with per-provider auth
     let parts_headers = parts.headers.clone();
     let method_clone = method.clone();
-    let body_bytes_clone = body_bytes.clone();
+    let body_bytes_clone = target_body_bytes.clone();
     let upstream_uri_clone = upstream_uri.clone();
 
     let send_upstream = |provider: Arc<Provider>| {
@@ -255,21 +298,23 @@ pub async fn handle_request(
                 .next()
                 .unwrap_or(&provider.base_url);
 
-            let mut req_builder = Request::builder().method(method).uri(uri);
+            let mut req_builder = Request::builder().method(method.clone()).uri(uri.clone());
 
-            for (name, value) in parts_headers.iter() {
-                let lower = name.as_str().to_lowercase();
-                if lower == "host"
-                    || lower == "authorization"
-                    || lower == "x-apikey"
-                    || lower == "content-length"
-                    || lower == "transfer-encoding"
-                    || lower == "connection"
-                    || lower == "x-llm-provider"
-                {
-                    continue;
+            if !matches!(provider.auth, AuthStyle::AwsSigv4 { .. }) {
+                for (name, value) in parts_headers.iter() {
+                    let lower = name.as_str().to_lowercase();
+                    if lower == "host"
+                        || lower == "authorization"
+                        || lower == "x-apikey"
+                        || lower == "content-length"
+                        || lower == "transfer-encoding"
+                        || lower == "connection"
+                        || lower == "x-llm-provider"
+                    {
+                        continue;
+                    }
+                    req_builder = req_builder.header(name, value);
                 }
-                req_builder = req_builder.header(name, value);
             }
 
             match &provider.auth {
@@ -323,12 +368,47 @@ pub async fn handle_request(
                         );
                     }
                 }
+                AuthStyle::AwsSigv4 { region, .. } => {
+                    let creds = provider.token_cache.get_aws_credentials().await?;
+                    let signer = SigV4Signer::new("bedrock", region, &creds);
+
+                    let mut headers_map = hyper::HeaderMap::new();
+                    headers_map.insert(hyper::header::HOST, HeaderValue::from_str(host_only)?);
+                    headers_map.insert(
+                        hyper::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    headers_map.insert(
+                        CACHE_CONTROL,
+                        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+                    );
+
+                    let path = uri.path();
+                    let query = uri.query();
+                    signer.sign_request(
+                        method.as_str(),
+                        path,
+                        query,
+                        &mut headers_map,
+                        &body_bytes,
+                        Utc::now(),
+                    )?;
+
+                    for (k, v) in headers_map.iter() {
+                        req_builder = req_builder.header(k, v);
+                    }
+                }
                 AuthStyle::None => {}
             }
 
-            req_builder = req_builder
-                .header(CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"))
-                .header(hyper::header::HOST, HeaderValue::from_str(host_only)?);
+            if !matches!(provider.auth, AuthStyle::AwsSigv4 { .. }) {
+                req_builder = req_builder
+                    .header(
+                        CACHE_CONTROL,
+                        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+                    )
+                    .header(hyper::header::HOST, HeaderValue::from_str(host_only)?);
+            }
 
             let built_req = req_builder.body(Body::from(body_bytes))?;
             let resp = provider.client.request(built_req).await?;
@@ -343,15 +423,22 @@ pub async fn handle_request(
 
     let result = match send_upstream(provider.clone()).await {
         Ok::<Response<Body>, anyhow::Error>(resp) => {
-            if resp.status() == StatusCode::UNAUTHORIZED {
-                warn!("Got 401 from provider {} - clearing cache and retrying once", provider.id);
+            if resp.status() == StatusCode::UNAUTHORIZED
+                && !matches!(provider.auth, AuthStyle::AwsSigv4 { .. })
+            {
+                warn!(
+                    "Got 401 from provider {} - clearing cache and retrying once",
+                    provider.id
+                );
                 provider.token_cache.clear_token().await;
                 match send_upstream(provider.clone()).await {
                     Ok(retry_resp) => {
                         if retry_resp.status().is_success() {
                             provider.record_success().await;
                         } else {
-                            provider.record_failure(format!("Status {}", retry_resp.status())).await;
+                            provider
+                                .record_failure(format!("Status {}", retry_resp.status()))
+                                .await;
                         }
                         record_usage_from_response(
                             retry_resp,
@@ -379,7 +466,9 @@ pub async fn handle_request(
                 if resp.status().is_success() {
                     provider.record_success().await;
                 } else if resp.status().is_server_error() {
-                    provider.record_failure(format!("Status {}", resp.status())).await;
+                    provider
+                        .record_failure(format!("Status {}", resp.status()))
+                        .await;
                 }
                 record_usage_from_response(
                     resp,
@@ -396,7 +485,10 @@ pub async fn handle_request(
         }
         Err(e) => {
             provider.record_failure(e.to_string()).await;
-            error!("Upstream request failed for provider {}: {}", provider.id, e);
+            error!(
+                "Upstream request failed for provider {}: {}",
+                provider.id, e
+            );
             Ok(openai_error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("Upstream request failed: {}", e),
@@ -462,8 +554,7 @@ pub fn parse_sse_usage(buf: &[u8], request_model: Option<&str>) -> Option<Parsed
         }
     }
 
-    let resolved_model = model
-        .or_else(|| request_model.map(|s| s.to_string()));
+    let resolved_model = model.or_else(|| request_model.map(|s| s.to_string()));
 
     if found_usage || cost.is_some() {
         Some((resolved_model, cost, tokens))
@@ -472,6 +563,7 @@ pub fn parse_sse_usage(buf: &[u8], request_model: Option<&str>) -> Option<Parsed
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_usage_from_response(
     resp: Response<Body>,
     usage_store: Arc<UsageStore>,
@@ -482,10 +574,19 @@ pub async fn record_usage_from_response(
     provider: Arc<Provider>,
     is_stream: bool,
 ) -> Result<Response<Body>> {
-    let (parts, body) = resp.into_parts();
+    let (mut parts, body) = resp.into_parts();
 
     if is_stream {
+        let is_bedrock = provider.dialect == Dialect::BedrockConverse;
         let success = parts.status.is_success();
+
+        if is_bedrock && success {
+            parts.headers.insert(
+                hyper::header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+        }
+
         struct TeeState {
             body: Body,
             buf: Vec<u8>,
@@ -496,7 +597,11 @@ pub async fn record_usage_from_response(
             canonical_model: String,
             provider: Arc<Provider>,
             success: bool,
+            is_bedrock: bool,
+            bedrock_decoder: EventStreamDecoder,
+            pending_sse_chunks: Vec<Bytes>,
         }
+
         let state = TeeState {
             body,
             buf: Vec::new(),
@@ -504,45 +609,91 @@ pub async fn record_usage_from_response(
             pricing: pricing.clone(),
             group,
             provider_id,
-            canonical_model,
+            canonical_model: canonical_model.clone(),
             provider,
             success,
+            is_bedrock,
+            bedrock_decoder: EventStreamDecoder::new(canonical_model),
+            pending_sse_chunks: Vec::new(),
         };
+
         let out = stream::unfold(state, |mut state| async move {
-            match state.body.next().await {
-                Some(Ok(chunk)) => {
-                    state.buf.extend_from_slice(&chunk);
-                    Some((Ok::<Bytes, hyper::Error>(chunk), state))
+            loop {
+                // If we have converted Bedrock SSE chunks queued, yield them first
+                if !state.pending_sse_chunks.is_empty() {
+                    let chunk = state.pending_sse_chunks.remove(0);
+                    return Some((Ok::<Bytes, hyper::Error>(chunk), state));
                 }
-                Some(Err(e)) => Some((Err(e), state)),
-                None => {
-                    if state.success {
-                        if let Some((_model, cost_reported, tokens)) =
-                            parse_sse_usage(&state.buf, Some(&state.canonical_model))
-                        {
-                            let cost_estimated = if cost_reported.is_none() {
-                                estimate_cost(&tokens, &state.provider, &state.canonical_model, &state.pricing).await
-                            } else {
-                                None
-                            };
-                            debug!(
-                                "Recorded streaming usage for group={} prov={} model={} reported={:?} estimated={:?}",
-                                state.group, state.provider_id, state.canonical_model, cost_reported, cost_estimated
-                            );
-                            let _ = state
-                                .usage_store
-                                .record_with_provider(
-                                    &state.group,
-                                    &state.provider_id,
-                                    &state.canonical_model,
-                                    cost_reported,
-                                    cost_estimated,
-                                    tokens,
-                                )
-                                .await;
+
+                match state.body.next().await {
+                    Some(Ok(chunk)) => {
+                        state.buf.extend_from_slice(&chunk);
+
+                        if state.is_bedrock && state.success {
+                            let sse_lines = state.bedrock_decoder.push_chunk(&chunk);
+                            for line in sse_lines {
+                                state.pending_sse_chunks.push(Bytes::from(line));
+                            }
+                            // Continue loop to emit queued chunks
+                            continue;
+                        } else {
+                            return Some((Ok::<Bytes, hyper::Error>(chunk), state));
                         }
                     }
-                    None
+                    Some(Err(e)) => return Some((Err(e), state)),
+                    None => {
+                        // End of stream
+                        if state.is_bedrock && state.success {
+                            // Emit terminal [DONE] if not emitted
+                            state
+                                .pending_sse_chunks
+                                .push(Bytes::from("data: [DONE]\n\n"));
+                        }
+
+                        if state.success {
+                            let parsed = if state.is_bedrock {
+                                // For Bedrock, parse usage from the decoded buffer
+                                parse_sse_usage(&state.buf, Some(&state.canonical_model))
+                            } else {
+                                parse_sse_usage(&state.buf, Some(&state.canonical_model))
+                            };
+
+                            if let Some((_model, cost_reported, tokens)) = parsed {
+                                let cost_estimated = if cost_reported.is_none() {
+                                    estimate_cost(
+                                        &tokens,
+                                        &state.provider,
+                                        &state.canonical_model,
+                                        &state.pricing,
+                                    )
+                                    .await
+                                } else {
+                                    None
+                                };
+                                debug!(
+                                    "Recorded streaming usage for group={} prov={} model={} reported={:?} estimated={:?}",
+                                    state.group, state.provider_id, state.canonical_model, cost_reported, cost_estimated
+                                );
+                                let _ = state
+                                    .usage_store
+                                    .record_with_provider(
+                                        &state.group,
+                                        &state.provider_id,
+                                        &state.canonical_model,
+                                        cost_reported,
+                                        cost_estimated,
+                                        tokens,
+                                    )
+                                    .await;
+                            }
+                        }
+
+                        if !state.pending_sse_chunks.is_empty() {
+                            let chunk = state.pending_sse_chunks.remove(0);
+                            return Some((Ok::<Bytes, hyper::Error>(chunk), state));
+                        }
+                        return None;
+                    }
                 }
             }
         });
@@ -551,8 +702,21 @@ pub async fn record_usage_from_response(
 
     // Non-streaming: buffer JSON
     let body_bytes = to_bytes(body).await?;
+
+    let final_body_bytes =
+        if provider.dialect == Dialect::BedrockConverse && parts.status.is_success() {
+            if let Ok(bedrock_json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+                let openai_json = transform_bedrock_to_openai(&bedrock_json, &canonical_model)?;
+                Bytes::from(serde_json::to_vec_pretty(&openai_json)?)
+            } else {
+                body_bytes
+            }
+        } else {
+            body_bytes
+        };
+
     if parts.status.is_success() {
-        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body_bytes) {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&final_body_bytes) {
             let cost_reported = json["cost"]["total"]
                 .as_f64()
                 .zip(json["cost"]["currency"].as_str().map(|s| s.to_string()));
@@ -584,7 +748,7 @@ pub async fn record_usage_from_response(
         }
     }
 
-    Ok(Response::from_parts(parts, Body::from(body_bytes)))
+    Ok(Response::from_parts(parts, Body::from(final_body_bytes)))
 }
 
 pub async fn estimate_cost(
@@ -602,15 +766,11 @@ pub async fn estimate_cost(
     let (in_rate, out_rate, currency) = if let Some(spec) = provider.models.get(upstream_key) {
         if let (Some(in_r), Some(out_r)) = (spec.input_cost_per_1m, spec.output_cost_per_1m) {
             (in_r, out_r, spec.currency.clone())
-        } else if let Some(dynamic) = pricing.lookup_rate(canonical_model).await {
-            dynamic
         } else {
-            return None;
+            pricing.lookup_rate(canonical_model).await?
         }
-    } else if let Some(dynamic) = pricing.lookup_rate(canonical_model).await {
-        dynamic
     } else {
-        return None;
+        pricing.lookup_rate(canonical_model).await?
     };
 
     let prompt_tokens = tokens.get("prompt_tokens").copied().unwrap_or(0);

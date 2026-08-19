@@ -27,6 +27,10 @@ dialoguer = "0.11"
 rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rustls-pemfile = "1.0"
 webpki-roots = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4.3"
+chrono = "0.4.45"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 plist = "1.3"

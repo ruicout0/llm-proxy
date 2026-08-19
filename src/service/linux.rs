@@ -65,7 +65,9 @@ WantedBy=default.target
 }
 
 fn run_systemctl(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("systemctl").args(args).output()?;
+    let output = std::process::Command::new("systemctl")
+        .args(args)
+        .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("systemctl failed: {}", stderr);

@@ -27,7 +27,10 @@ pub fn install(cfg_path: &Path, env_vars: HashMap<String, String>) -> Result<()>
     }
 
     let mut plist = Dictionary::new();
-    plist.insert("Label".to_string(), PlistValue::String(SERVICE_LABEL.to_string()));
+    plist.insert(
+        "Label".to_string(),
+        PlistValue::String(SERVICE_LABEL.to_string()),
+    );
     plist.insert(
         "ProgramArguments".to_string(),
         PlistValue::Array(vec![
@@ -45,10 +48,18 @@ pub fn install(cfg_path: &Path, env_vars: HashMap<String, String>) -> Result<()>
         "StandardErrorPath".to_string(),
         PlistValue::String(err_log.to_string_lossy().to_string()),
     );
-    plist.insert("EnvironmentVariables".to_string(), PlistValue::Dictionary(env_dict));
+    plist.insert(
+        "EnvironmentVariables".to_string(),
+        PlistValue::Dictionary(env_dict),
+    );
     plist.insert(
         "WorkingDirectory".to_string(),
-        PlistValue::String(home_dir().context("No home directory")?.to_string_lossy().to_string()),
+        PlistValue::String(
+            home_dir()
+                .context("No home directory")?
+                .to_string_lossy()
+                .to_string(),
+        ),
     );
 
     let path = plist_path()?;
@@ -65,7 +76,9 @@ pub fn install(cfg_path: &Path, env_vars: HashMap<String, String>) -> Result<()>
 }
 
 fn run_launchctl(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("launchctl").args(args).output()?;
+    let output = std::process::Command::new("launchctl")
+        .args(args)
+        .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("launchctl failed: {}", stderr);
