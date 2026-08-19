@@ -95,6 +95,7 @@ pub fn resolve_bedrock_inference_profile_id(model_id: &str, aws_region: &str) ->
         || model_id.starts_with("us.")
         || model_id.starts_with("apac.")
         || model_id.starts_with("cr.")
+        || model_id.starts_with("global.")
         || model_id.starts_with("arn:")
     {
         return model_id.to_string();
@@ -110,12 +111,20 @@ pub fn resolve_bedrock_inference_profile_id(model_id: &str, aws_region: &str) ->
         "eu"
     };
 
-    // Models requiring inference profile IDs on on-demand throughput
+    // Models requiring inference profile IDs on on-demand throughput:
+    // Bedrock enforces inference profiles for all modern Anthropic Claude models (3.5+, 4.x, 5.x, Opus, Sonnet, Haiku, Fable),
+    // Amazon Nova models, Meta Llama 3+, DeepSeek, Mistral Pixtral/Devstral, and OpenAI on Bedrock.
     if model_id.starts_with("amazon.nova-")
-        || model_id.starts_with("anthropic.claude-3-5-")
-        || model_id.starts_with("anthropic.claude-3-7-")
-        || model_id.starts_with("anthropic.claude-3-haiku-")
+        || model_id.starts_with("amazon.nova")
+        || model_id.starts_with("anthropic.claude-")
+        || model_id.starts_with("anthropic.claude")
         || model_id.starts_with("deepseek.")
+        || model_id.starts_with("mistral.pixtral-")
+        || model_id.starts_with("mistral.devstral-")
+        || model_id.starts_with("openai.gpt-")
+        || model_id.starts_with("meta.llama3-")
+        || model_id.starts_with("meta.llama-3")
+        || model_id.starts_with("qwen.qwen3-")
     {
         format!("{}.{}", geo, model_id)
     } else {
@@ -401,8 +410,12 @@ mod tests {
             "eu.amazon.nova-pro-v1:0"
         );
         assert_eq!(
-            resolve_bedrock_inference_profile_id("meta.llama3-70b-instruct-v1:0", "eu-central-1"),
-            "meta.llama3-70b-instruct-v1:0"
+            resolve_bedrock_inference_profile_id("anthropic.claude-opus-5", "eu-central-1"),
+            "eu.anthropic.claude-opus-5"
+        );
+        assert_eq!(
+            resolve_bedrock_inference_profile_id("cohere.embed-english-v3", "eu-central-1"),
+            "cohere.embed-english-v3"
         );
     }
 }
