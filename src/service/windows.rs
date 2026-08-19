@@ -24,9 +24,7 @@ pub fn install(cfg_path: &Path, _env_vars: HashMap<String, String>) -> Result<()
 pub fn start() -> Result<()> {
     let bin = binary_path()?;
     info!("Starting llm-proxy in background...");
-    std::process::Command::new(bin)
-        .arg("run")
-        .spawn()?;
+    std::process::Command::new(bin).arg("run").spawn()?;
     info!("Service started. Check task manager or logs.");
     Ok(())
 }

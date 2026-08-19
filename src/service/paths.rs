@@ -31,8 +31,12 @@ pub fn log_dir() -> Result<PathBuf> {
 
 pub fn binary_path() -> Result<PathBuf> {
     let current_exe = std::env::current_exe()?;
-    let exe_name = if cfg!(windows) { "llm-proxy.exe" } else { "llm-proxy" };
-    
+    let exe_name = if cfg!(windows) {
+        "llm-proxy.exe"
+    } else {
+        "llm-proxy"
+    };
+
     if current_exe.file_name().and_then(|s| s.to_str()) == Some(exe_name) {
         Ok(current_exe)
     } else {

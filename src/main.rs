@@ -1,12 +1,14 @@
 //! llm-proxy - Multi-Provider LLM Proxy with auth header injection, usage tracking, and model discovery.
 
 pub mod config;
+pub mod dialect;
 pub mod discovery;
 pub mod pricing;
 pub mod provider;
 pub mod proxy;
-pub mod service;
 pub mod router;
+pub mod service;
+pub mod sigv4;
 pub mod usage;
 
 use anyhow::{Context, Result};
@@ -20,16 +22,20 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::config::{default_usage_store_path, ConfigFile, ProviderConfig};
-use crate::service::paths::default_config_path;
 use crate::discovery::DiscoveryCache;
 use crate::pricing::PricingRegistry;
 use crate::provider::KEYCHAIN_SERVICE;
 use crate::proxy::handle_request;
 use crate::router::Registry;
+use crate::service::paths::default_config_path;
 use crate::usage::UsageStore;
 
 #[derive(Parser)]
-#[command(name = "llm-proxy", version, about = "Lightweight multi-provider LLM proxy with OAuth token refresh and usage tracking")]
+#[command(
+    name = "llm-proxy",
+    version,
+    about = "Lightweight multi-provider LLM proxy with OAuth token refresh and usage tracking"
+)]
 struct Cli {
     /// Path to config file (default: ~/.config/llm-proxy/config.toml)
     #[arg(short = 'c', long, global = true)]
@@ -45,7 +51,7 @@ enum Command {
     Run,
     /// Interactive setup - create config file
     Setup,
-    /// Install as macOS launchd service
+    /// Install as service
     Install(InstallArgs),
     /// Start the service
     Start,
@@ -140,19 +146,13 @@ struct InstallArgs {
     use_keychain: bool,
 }
 
-// ============================================================================
-// Runtime & Service Helpers
-// ============================================================================
-
-
-
-
 pub fn config_path() -> Result<PathBuf> {
     default_config_path()
 }
 
 pub fn load_config(path_override: Option<PathBuf>) -> Result<ConfigFile> {
-    let path = path_override.unwrap_or_else(|| config_path().unwrap_or_else(|_| PathBuf::from("config.toml")));
+    let path = path_override
+        .unwrap_or_else(|| config_path().unwrap_or_else(|_| PathBuf::from("config.toml")));
     if !path.exists() {
         anyhow::bail!(
             "Config file not found at: {}. Run 'llm-proxy install' or create it manually.",
@@ -177,21 +177,34 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
 
     if args.use_keychain {
         if let Some(ref key) = args.api_key {
-            Entry::new(KEYCHAIN_SERVICE, &format!("{}:api_key", default_prov_id))?.set_password(key)?;
+            Entry::new(KEYCHAIN_SERVICE, &format!("{}:api_key", default_prov_id))?
+                .set_password(key)?;
         }
         if let Some(ref token) = args.bearer_token {
-            Entry::new(KEYCHAIN_SERVICE, &format!("{}:bearer_token", default_prov_id))?.set_password(token)?;
+            Entry::new(
+                KEYCHAIN_SERVICE,
+                &format!("{}:bearer_token", default_prov_id),
+            )?
+            .set_password(token)?;
         }
         if let Some(ref secret) = args.client_secret {
-            Entry::new(KEYCHAIN_SERVICE, &format!("{}:client_secret", default_prov_id))?.set_password(secret)?;
+            Entry::new(
+                KEYCHAIN_SERVICE,
+                &format!("{}:client_secret", default_prov_id),
+            )?
+            .set_password(secret)?;
         }
-        info!("Stored secrets in system keyring under namespace: {}", default_prov_id);
+        info!(
+            "Stored secrets in system keyring under namespace: {}",
+            default_prov_id
+        );
     }
 
     let prov = ProviderConfig {
         id: default_prov_id.clone(),
         base_url: args.host.unwrap_or_else(|| "api.example.com".to_string()),
         scheme: Some("https".to_string()),
+        dialect: Some(crate::config::DialectConfig::OpenaiCompatible),
         auth_style: if args.bearer_token.is_some() {
             Some(crate::config::AuthStyleConfig::StaticBearer)
         } else if args.m2m_oauth_url.is_some() {
@@ -199,18 +212,50 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         } else {
             None
         },
-        api_key: if args.use_keychain { None } else { args.api_key.clone() },
-        api_key_ref: if args.use_keychain { Some(format!("keychain:{}:api_key", default_prov_id)) } else { None },
-        bearer_token: if args.use_keychain { None } else { args.bearer_token.clone() },
-        bearer_token_ref: if args.use_keychain { Some(format!("keychain:{}:bearer_token", default_prov_id)) } else { None },
+        api_key: if args.use_keychain {
+            None
+        } else {
+            args.api_key.clone()
+        },
+        api_key_ref: if args.use_keychain {
+            Some(format!("keychain:{}:api_key", default_prov_id))
+        } else {
+            None
+        },
+        bearer_token: if args.use_keychain {
+            None
+        } else {
+            args.bearer_token.clone()
+        },
+        bearer_token_ref: if args.use_keychain {
+            Some(format!("keychain:{}:bearer_token", default_prov_id))
+        } else {
+            None
+        },
         m2m_oauth_url: args.m2m_oauth_url.clone(),
         client_id: args.client_id.clone(),
-        client_secret: if args.use_keychain { None } else { args.client_secret.clone() },
-        client_secret_ref: if args.use_keychain { Some(format!("keychain:{}:client_secret", default_prov_id)) } else { None },
+        client_secret: if args.use_keychain {
+            None
+        } else {
+            args.client_secret.clone()
+        },
+        client_secret_ref: if args.use_keychain {
+            Some(format!("keychain:{}:client_secret", default_prov_id))
+        } else {
+            None
+        },
         oauth_scope: None,
         header_name: None,
         header_value: None,
         header_value_ref: None,
+        aws_region: None,
+        aws_access_key_id: None,
+        aws_access_key_id_ref: None,
+        aws_secret_access_key: None,
+        aws_secret_access_key_ref: None,
+        aws_session_token: None,
+        aws_session_token_ref: None,
+        aws_profile: None,
         ca_cert_path: None,
         insecure_skip_tls_verify: false,
         models: Vec::new(),
@@ -241,7 +286,10 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
     info!("Wrote config file: {}", cfg_path.display());
 
     let mut env_vars = std::collections::HashMap::new();
-    env_vars.insert("LLM_PROXY_CONFIG".to_string(), cfg_path.to_string_lossy().to_string());
+    env_vars.insert(
+        "LLM_PROXY_CONFIG".to_string(),
+        cfg_path.to_string_lossy().to_string(),
+    );
     env_vars.insert("RUST_LOG".to_string(), "info".to_string());
     if let Ok(proxy) = std::env::var("HTTPS_PROXY").or_else(|_| std::env::var("https_proxy")) {
         env_vars.insert("https_proxy".to_string(), proxy.clone());
@@ -314,7 +362,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
-        pricing_cache_path: None,
+                pricing_cache_path: None,
                 default_provider: "bmw".to_string(),
                 model_separator: '/',
                 discovery_ttl_secs: 300,
@@ -335,7 +383,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
             ca_cert_path: None,
             insecure_skip_tls_verify: false,
             usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
-        pricing_cache_path: None,
+            pricing_cache_path: None,
             default_provider: "bmw".to_string(),
             model_separator: '/',
             discovery_ttl_secs: 300,
@@ -362,24 +410,14 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
         match action {
             0 => {
                 let id: String = Input::new()
-                    .with_prompt("Provider ID (e.g., bmw, openai, anthropic, ollama)")
+                    .with_prompt("Provider ID (e.g., bmw, openai, anthropic, bedrock, ollama)")
                     .interact_text()?;
-
-                let base_url: String = Input::new()
-                    .with_prompt("Base URL / Host (e.g. api.openai.com, api.internal.bmw.com, 127.0.0.1:11434/v1)")
-                    .interact_text()?;
-
-                let scheme_choice = Select::new()
-                    .with_prompt("Scheme")
-                    .items(&["https", "http"])
-                    .default(0)
-                    .interact()?;
-                let scheme = if scheme_choice == 0 { "https" } else { "http" };
 
                 let auth_choice = Select::new()
                     .with_prompt("Authentication Style")
                     .items(&[
                         "Bearer API Key (e.g. OpenAI / Standard)",
+                        "AWS SigV4 (Amazon Bedrock)",
                         "OAuth M2M Client Credentials (e.g. BMW Gateway)",
                         "Static Bearer Token",
                         "Custom Header (e.g. x-api-key)",
@@ -388,15 +426,39 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                     .default(0)
                     .interact()?;
 
-                let use_keychain = Confirm::new()
-                    .with_prompt("Store secret credentials securely in macOS Keychain?")
-                    .default(true)
-                    .interact()?;
+                let mut base_url: String = if auth_choice == 1 {
+                    String::new()
+                } else {
+                    Input::new()
+                        .with_prompt("Base URL / Host (e.g. api.openai.com, api.internal.bmw.com, 127.0.0.1:11434/v1)")
+                        .interact_text()?
+                };
+
+                let scheme_choice = if auth_choice == 1 {
+                    0
+                } else {
+                    Select::new()
+                        .with_prompt("Scheme")
+                        .items(&["https", "http"])
+                        .default(0)
+                        .interact()?
+                };
+                let scheme = if scheme_choice == 0 { "https" } else { "http" };
+
+                let use_keychain = if auth_choice == 1 {
+                    false
+                } else {
+                    Confirm::new()
+                        .with_prompt("Store secret credentials securely in System Keyring?")
+                        .default(true)
+                        .interact()?
+                };
 
                 let mut prov = ProviderConfig {
                     id: id.clone(),
-                    base_url,
+                    base_url: String::new(),
                     scheme: Some(scheme.to_string()),
+                    dialect: None,
                     auth_style: None,
                     api_key: None,
                     api_key_ref: None,
@@ -410,6 +472,14 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                     header_name: None,
                     header_value: None,
                     header_value_ref: None,
+                    aws_region: None,
+                    aws_access_key_id: None,
+                    aws_access_key_id_ref: None,
+                    aws_secret_access_key: None,
+                    aws_secret_access_key_ref: None,
+                    aws_session_token: None,
+                    aws_session_token_ref: None,
+                    aws_profile: None,
                     ca_cert_path: None,
                     insecure_skip_tls_verify: false,
                     models: Vec::new(),
@@ -418,6 +488,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                 match auth_choice {
                     0 => {
                         prov.auth_style = Some(crate::config::AuthStyleConfig::BearerApiKey);
+                        prov.dialect = Some(crate::config::DialectConfig::OpenaiCompatible);
                         let key: String = Input::new().with_prompt("API Key").interact_text()?;
                         if use_keychain {
                             let account = format!("{}:api_key", id);
@@ -428,11 +499,88 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                         }
                     }
                     1 => {
+                        prov.auth_style = Some(crate::config::AuthStyleConfig::AwsSigv4);
+                        prov.dialect = Some(crate::config::DialectConfig::BedrockConverse);
+
+                        let region: String = Input::new()
+                            .with_prompt("AWS Region (e.g. eu-central-1, us-east-1)")
+                            .default("eu-central-1".to_string())
+                            .interact_text()?;
+
+                        base_url = format!("bedrock-runtime.{}.amazonaws.com", region);
+                        prov.aws_region = Some(region);
+
+                        let cred_source = Select::new()
+                            .with_prompt("AWS Credential Source")
+                            .items(&[
+                                "AWS CLI / SSO Profile (Recommended - auto refreshes credentials)",
+                                "Explicit Access Key & Secret (Manual / Keychain)",
+                            ])
+                            .default(0)
+                            .interact()?;
+
+                        if cred_source == 0 {
+                            let profile: String = Input::new()
+                                .with_prompt("AWS Profile name from ~/.aws/config (leave empty for 'default')")
+                                .allow_empty(true)
+                                .interact_text()?;
+                            if !profile.is_empty() {
+                                prov.aws_profile = Some(profile);
+                            }
+                        } else {
+                            let store_in_keychain = Confirm::new()
+                                .with_prompt("Store secret credentials securely in System Keyring?")
+                                .default(true)
+                                .interact()?;
+
+                            let key_id: String = Input::new()
+                                .with_prompt("AWS Access Key ID")
+                                .interact_text()?;
+                            let secret: String = Input::new()
+                                .with_prompt("AWS Secret Access Key")
+                                .interact_text()?;
+                            let token: String = Input::new()
+                                .with_prompt("AWS Session Token (optional, press Enter to skip)")
+                                .allow_empty(true)
+                                .interact_text()?;
+
+                            if store_in_keychain {
+                                let key_acc = format!("{}:aws_access_key_id", id);
+                                let sec_acc = format!("{}:aws_secret_access_key", id);
+                                Entry::new(KEYCHAIN_SERVICE, &key_acc)?.set_password(&key_id)?;
+                                Entry::new(KEYCHAIN_SERVICE, &sec_acc)?.set_password(&secret)?;
+                                prov.aws_access_key_id_ref = Some(format!("keychain:{}", key_acc));
+                                prov.aws_secret_access_key_ref =
+                                    Some(format!("keychain:{}", sec_acc));
+
+                                if !token.is_empty() {
+                                    let tok_acc = format!("{}:aws_session_token", id);
+                                    Entry::new(KEYCHAIN_SERVICE, &tok_acc)?.set_password(&token)?;
+                                    prov.aws_session_token_ref =
+                                        Some(format!("keychain:{}", tok_acc));
+                                }
+                            } else {
+                                prov.aws_access_key_id = Some(key_id);
+                                prov.aws_secret_access_key = Some(secret);
+                                if !token.is_empty() {
+                                    prov.aws_session_token = Some(token);
+                                }
+                            }
+                        }
+                    }
+                    2 => {
                         prov.auth_style = Some(crate::config::AuthStyleConfig::OauthM2m);
-                        let oauth_url: String = Input::new().with_prompt("M2M OAuth Token Endpoint URL").interact_text()?;
-                        let client_id: String = Input::new().with_prompt("Client ID").interact_text()?;
-                        let client_secret: String = Input::new().with_prompt("Client Secret").interact_text()?;
-                        let api_key: String = Input::new().with_prompt("X-API-Key (gateway header)").interact_text()?;
+                        prov.dialect = Some(crate::config::DialectConfig::OpenaiCompatible);
+                        let oauth_url: String = Input::new()
+                            .with_prompt("M2M OAuth Token Endpoint URL")
+                            .interact_text()?;
+                        let client_id: String =
+                            Input::new().with_prompt("Client ID").interact_text()?;
+                        let client_secret: String =
+                            Input::new().with_prompt("Client Secret").interact_text()?;
+                        let api_key: String = Input::new()
+                            .with_prompt("X-API-Key (gateway header)")
+                            .interact_text()?;
                         let scope: String = Input::new()
                             .with_prompt("OAuth Scope (optional, press Enter to skip)")
                             .allow_empty(true)
@@ -456,9 +604,11 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                             prov.api_key = Some(api_key);
                         }
                     }
-                    2 => {
+                    3 => {
                         prov.auth_style = Some(crate::config::AuthStyleConfig::StaticBearer);
-                        let token: String = Input::new().with_prompt("Bearer Token").interact_text()?;
+                        prov.dialect = Some(crate::config::DialectConfig::OpenaiCompatible);
+                        let token: String =
+                            Input::new().with_prompt("Bearer Token").interact_text()?;
                         if use_keychain {
                             let account = format!("{}:bearer_token", id);
                             Entry::new(KEYCHAIN_SERVICE, &account)?.set_password(&token)?;
@@ -467,10 +617,15 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                             prov.bearer_token = Some(token);
                         }
                     }
-                    3 => {
+                    4 => {
                         prov.auth_style = Some(crate::config::AuthStyleConfig::CustomHeader);
-                        let h_name: String = Input::new().with_prompt("Header Name (e.g. x-api-key)").interact_text()?;
-                        let h_val: String = Input::new().with_prompt("Header Value / Secret").interact_text()?;
+                        prov.dialect = Some(crate::config::DialectConfig::OpenaiCompatible);
+                        let h_name: String = Input::new()
+                            .with_prompt("Header Name (e.g. x-api-key)")
+                            .interact_text()?;
+                        let h_val: String = Input::new()
+                            .with_prompt("Header Value / Secret")
+                            .interact_text()?;
                         prov.header_name = Some(h_name);
                         if use_keychain {
                             let account = format!("{}:header_val", id);
@@ -480,11 +635,14 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                             prov.header_value = Some(h_val);
                         }
                     }
-                    4 => {
+                    5 => {
                         prov.auth_style = Some(crate::config::AuthStyleConfig::None);
+                        prov.dialect = Some(crate::config::DialectConfig::OpenaiCompatible);
                     }
                     _ => {}
                 }
+
+                prov.base_url = base_url;
 
                 // Remove previous definition if exists
                 config.providers.retain(|p| p.id != id);
@@ -498,7 +656,8 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                 if config.providers.is_empty() {
                     println!("No providers configured yet. Please add a provider first.\n");
                 } else {
-                    let prov_names: Vec<String> = config.providers.iter().map(|p| p.id.clone()).collect();
+                    let prov_names: Vec<String> =
+                        config.providers.iter().map(|p| p.id.clone()).collect();
                     let sel = Select::new()
                         .with_prompt("Select default provider")
                         .items(&prov_names)
@@ -551,12 +710,14 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-
 async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<()> {
     let cfg = load_config(config_file).ok();
     let store_path = args
         .store_path
-        .or_else(|| cfg.as_ref().and_then(|c| c.usage_store_path.clone().map(PathBuf::from)))
+        .or_else(|| {
+            cfg.as_ref()
+                .and_then(|c| c.usage_store_path.clone().map(PathBuf::from))
+        })
         .unwrap_or_else(default_usage_store_path);
 
     let store = UsageStore::new(store_path.clone());
@@ -630,7 +791,10 @@ fn migrate_keychain(args: MigrateKeychainArgs) -> Result<()> {
         if let Ok(entry) = Entry::new(KEYCHAIN_SERVICE, legacy) {
             if let Ok(val) = entry.get_password() {
                 if args.dry_run {
-                    println!("  [DRY RUN] Found '{}', would copy to '{}'", legacy, new_account);
+                    println!(
+                        "  [DRY RUN] Found '{}', would copy to '{}'",
+                        legacy, new_account
+                    );
                 } else {
                     let new_entry = Entry::new(KEYCHAIN_SERVICE, new_account)?;
                     new_entry.set_password(&val)?;
@@ -653,14 +817,25 @@ fn providers_command(_args: ProvidersArgs, config_file: Option<PathBuf>) -> Resu
     let cfg = load_config(config_file)?;
     let (_, providers) = cfg.normalize_providers();
 
-    println!("Configured Providers (Default: {}):\n", cfg.default_provider);
+    println!(
+        "Configured Providers (Default: {}):\n",
+        cfg.default_provider
+    );
     for p in providers {
         println!("Provider: {}", p.id);
-        println!("  Base URL: {}://{}", p.scheme.as_deref().unwrap_or("https"), p.base_url);
+        println!(
+            "  Base URL: {}://{}",
+            p.scheme.as_deref().unwrap_or("https"),
+            p.base_url
+        );
         println!("  Auth Style: {:?}", p.auth_style);
+        println!("  Dialect: {:?}", p.dialect);
         println!("  Models configured: {}", p.models.len());
         for m in &p.models {
-            println!("    - ID: {} (alias: {:?}, hidden: {})", m.id, m.alias, m.hidden);
+            println!(
+                "    - ID: {} (alias: {:?}, hidden: {})",
+                m.id, m.alias, m.hidden
+            );
         }
         println!();
     }
@@ -711,7 +886,10 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
         tokio::spawn(async move {
             info!("Fetching latest LLM pricing catalog...");
             if let Err(e) = pr.fetch_latest().await {
-                warn!("Pricing catalog sync encountered errors (will use cache/fallback): {}", e);
+                warn!(
+                    "Pricing catalog sync encountered errors (will use cache/fallback): {}",
+                    e
+                );
             }
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86400));
             interval.tick().await; // skip initial tick
@@ -731,6 +909,8 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
         let reg = registry.clone();
         tokio::spawn(async move {
             info!("Warming model discovery cache...");
+            // Add a 1s delay to let server start and pricing cache settle
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             if let Err(e) = disc.get_models(&reg).await {
                 warn!("Initial discovery warming encountered errors: {}", e);
             } else {
@@ -823,6 +1003,28 @@ bearer_token = "static-token-abc"
     }
 
     #[test]
+    fn config_file_parses_bedrock_provider() {
+        let content = r#"
+[[providers]]
+id = "bedrock"
+base_url = "bedrock-runtime.eu-central-1.amazonaws.com"
+auth_style = "aws_sigv4"
+dialect = "bedrock_converse"
+aws_region = "eu-central-1"
+aws_access_key_id = "AKIAEXAMPLE"
+aws_secret_access_key = "SECRETEXAMPLE"
+"#;
+        let cfg: ConfigFile = toml::from_str(content).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.providers.len(), 1);
+        let p = &cfg.providers[0];
+        assert_eq!(p.id, "bedrock");
+        assert_eq!(p.auth_style, Some(AuthStyleConfig::AwsSigv4));
+        assert_eq!(p.dialect, Some(DialectConfig::BedrockConverse));
+        assert_eq!(p.aws_region, Some("eu-central-1".to_string()));
+    }
+
+    #[test]
     fn config_file_parses_oauth_fields() {
         let content = r#"
 llm_host = "api.example.com"
@@ -885,6 +1087,7 @@ bearer_token = "token"
                 id: "test".to_string(),
                 base_url: "api.example.com".to_string(),
                 scheme: Some("https".to_string()),
+                dialect: Some(DialectConfig::OpenaiCompatible),
                 auth_style: Some(AuthStyleConfig::StaticBearer),
                 api_key: Some("key".into()),
                 api_key_ref: None,
@@ -898,6 +1101,14 @@ bearer_token = "token"
                 header_name: None,
                 header_value: None,
                 header_value_ref: None,
+                aws_region: None,
+                aws_access_key_id: None,
+                aws_access_key_id_ref: None,
+                aws_secret_access_key: None,
+                aws_secret_access_key_ref: None,
+                aws_session_token: None,
+                aws_session_token_ref: None,
+                aws_profile: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 models: Vec::new(),
@@ -916,6 +1127,7 @@ bearer_token = "token"
                 id: "test".to_string(),
                 base_url: "api.example.com".to_string(),
                 scheme: Some("https".to_string()),
+                dialect: Some(DialectConfig::OpenaiCompatible),
                 auth_style: Some(AuthStyleConfig::StaticBearer),
                 api_key: Some("key".into()),
                 api_key_ref: None,
@@ -929,6 +1141,14 @@ bearer_token = "token"
                 header_name: None,
                 header_value: None,
                 header_value_ref: None,
+                aws_region: None,
+                aws_access_key_id: None,
+                aws_access_key_id_ref: None,
+                aws_secret_access_key: None,
+                aws_secret_access_key_ref: None,
+                aws_session_token: None,
+                aws_session_token_ref: None,
+                aws_profile: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 models: Vec::new(),
@@ -949,6 +1169,7 @@ bearer_token = "token"
                 id: "test".to_string(),
                 base_url: "api.example.com".to_string(),
                 scheme: Some("https".to_string()),
+                dialect: Some(DialectConfig::OpenaiCompatible),
                 auth_style: Some(AuthStyleConfig::StaticBearer),
                 api_key: Some("my-api-key".into()),
                 api_key_ref: None,
@@ -962,6 +1183,14 @@ bearer_token = "token"
                 header_name: None,
                 header_value: None,
                 header_value_ref: None,
+                aws_region: None,
+                aws_access_key_id: None,
+                aws_access_key_id_ref: None,
+                aws_secret_access_key: None,
+                aws_secret_access_key_ref: None,
+                aws_session_token: None,
+                aws_session_token_ref: None,
+                aws_profile: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 models: Vec::new(),
@@ -1271,13 +1500,19 @@ api_key = "openai-key"
         let registry = Registry::new(&cfg);
 
         // 1. Prefixed model
-        let r1 = registry.resolve_route(Some("openai/gpt-4o"), None).await.unwrap();
+        let r1 = registry
+            .resolve_route(Some("openai/gpt-4o"), None)
+            .await
+            .unwrap();
         assert_eq!(r1.provider.id, "openai");
         assert_eq!(r1.upstream_model, "gpt-4o");
         assert_eq!(r1.canonical_model, "openai/gpt-4o");
 
         // 1b. Unknown provider prefix -> error
-        assert!(registry.resolve_route(Some("unknown/model"), None).await.is_err());
+        assert!(registry
+            .resolve_route(Some("unknown/model"), None)
+            .await
+            .is_err());
 
         // 2. Alias
         let r2 = registry.resolve_route(Some("fast"), None).await.unwrap();
@@ -1285,7 +1520,10 @@ api_key = "openai-key"
         assert_eq!(r2.canonical_model, "bmw/gpt-4o");
 
         // 3. x-llm-provider header
-        let r3 = registry.resolve_route(Some("gpt-4o"), Some("openai")).await.unwrap();
+        let r3 = registry
+            .resolve_route(Some("gpt-4o"), Some("openai"))
+            .await
+            .unwrap();
         assert_eq!(r3.provider.id, "openai");
         assert_eq!(r3.canonical_model, "openai/gpt-4o");
 
@@ -1297,10 +1535,16 @@ api_key = "openai-key"
         // 4b. Ambiguous bare name without provider (gpt-4o is in both bmw and openai)
         let r_amb = registry.resolve_route(Some("gpt-4o"), None).await;
         assert!(r_amb.is_err());
-        assert!(r_amb.unwrap_err().to_string().contains("Ambiguous model 'gpt-4o'"));
+        assert!(r_amb
+            .unwrap_err()
+            .to_string()
+            .contains("Ambiguous model 'gpt-4o'"));
 
         // 5. Fallback to default_provider for unknown un-indexed model
-        let r5 = registry.resolve_route(Some("unlisted-model"), None).await.unwrap();
+        let r5 = registry
+            .resolve_route(Some("unlisted-model"), None)
+            .await
+            .unwrap();
         assert_eq!(r5.provider.id, "bmw");
         assert_eq!(r5.upstream_model, "unlisted-model");
         assert_eq!(r5.canonical_model, "bmw/unlisted-model");
@@ -1373,6 +1617,7 @@ api_key = "openai-key"
             id: "openai".to_string(),
             base_url: "api.openai.com".to_string(),
             scheme: Some("https".to_string()),
+            dialect: Some(DialectConfig::OpenaiCompatible),
             auth_style: Some(AuthStyleConfig::BearerApiKey),
             api_key: Some("key".to_string()),
             api_key_ref: None,
@@ -1386,6 +1631,14 @@ api_key = "openai-key"
             header_name: None,
             header_value: None,
             header_value_ref: None,
+            aws_region: None,
+            aws_access_key_id: None,
+            aws_access_key_id_ref: None,
+            aws_secret_access_key: None,
+            aws_secret_access_key_ref: None,
+            aws_session_token: None,
+            aws_session_token_ref: None,
+            aws_profile: None,
             ca_cert_path: None,
             insecure_skip_tls_verify: false,
             models: vec![ModelSpec {
@@ -1406,7 +1659,9 @@ api_key = "openai-key"
         tokens.insert("prompt_tokens".to_string(), 1_000_000_u64);
         tokens.insert("completion_tokens".to_string(), 500_000_u64);
 
-        let (est_cost, currency) = estimate_cost(&tokens, &prov, "openai/gpt-4o", &pricing).await.unwrap();
+        let (est_cost, currency) = estimate_cost(&tokens, &prov, "openai/gpt-4o", &pricing)
+            .await
+            .unwrap();
         assert_eq!(currency, "USD");
         assert_eq!(est_cost, 2.50 + 5.00); // 2.50 + 5.00 = 7.50
     }
@@ -1414,11 +1669,20 @@ api_key = "openai-key"
     #[test]
     fn traffic_classification_rules() {
         let mut h = hyper::HeaderMap::new();
-        assert_eq!(classify_traffic("/llm-proxy/usage", &h), TrafficClass::Local);
+        assert_eq!(
+            classify_traffic("/llm-proxy/usage", &h),
+            TrafficClass::Local
+        );
         assert_eq!(classify_traffic("/v1/models", &h), TrafficClass::Discovery);
-        assert_eq!(classify_traffic("/v1/chat/completions", &h), TrafficClass::Billable);
+        assert_eq!(
+            classify_traffic("/v1/chat/completions", &h),
+            TrafficClass::Billable
+        );
 
         h.insert("x-llm-probe", "true".parse().unwrap());
-        assert_eq!(classify_traffic("/v1/chat/completions", &h), TrafficClass::Probe);
+        assert_eq!(
+            classify_traffic("/v1/chat/completions", &h),
+            TrafficClass::Probe
+        );
     }
 }

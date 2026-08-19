@@ -61,7 +61,15 @@ pub enum AuthStyleConfig {
     BearerApiKey,
     StaticBearer,
     CustomHeader,
+    AwsSigv4,
     None,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum DialectConfig {
+    OpenaiCompatible,
+    BedrockConverse,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -70,6 +78,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     #[serde(default = "default_scheme")]
     pub scheme: Option<String>,
+    #[serde(default)]
+    pub dialect: Option<DialectConfig>,
     #[serde(default)]
     pub auth_style: Option<AuthStyleConfig>,
     #[serde(default)]
@@ -96,6 +106,25 @@ pub struct ProviderConfig {
     pub header_value: Option<String>,
     #[serde(default)]
     pub header_value_ref: Option<String>,
+
+    // AWS SigV4 specific configuration
+    #[serde(default)]
+    pub aws_region: Option<String>,
+    #[serde(default)]
+    pub aws_access_key_id: Option<String>,
+    #[serde(default)]
+    pub aws_access_key_id_ref: Option<String>,
+    #[serde(default)]
+    pub aws_secret_access_key: Option<String>,
+    #[serde(default)]
+    pub aws_secret_access_key_ref: Option<String>,
+    #[serde(default)]
+    pub aws_session_token: Option<String>,
+    #[serde(default)]
+    pub aws_session_token_ref: Option<String>,
+    #[serde(default)]
+    pub aws_profile: Option<String>,
+
     #[serde(default)]
     pub ca_cert_path: Option<String>,
     #[serde(default)]
@@ -188,6 +217,7 @@ impl ConfigFile {
                 id: "default".to_string(),
                 base_url: host,
                 scheme: Some("https".to_string()),
+                dialect: Some(DialectConfig::OpenaiCompatible),
                 auth_style,
                 api_key: self.api_key.clone(),
                 api_key_ref: None,
@@ -201,6 +231,14 @@ impl ConfigFile {
                 header_name: None,
                 header_value: None,
                 header_value_ref: None,
+                aws_region: None,
+                aws_access_key_id: None,
+                aws_access_key_id_ref: None,
+                aws_secret_access_key: None,
+                aws_secret_access_key_ref: None,
+                aws_session_token: None,
+                aws_session_token_ref: None,
+                aws_profile: None,
                 ca_cert_path: self.ca_cert_path.clone(),
                 insecure_skip_tls_verify: self.insecure_skip_tls_verify,
                 models: Vec::new(),

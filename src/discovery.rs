@@ -9,8 +9,9 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use crate::config::ConfigFile;
-use crate::provider::{DiscoveryState, Provider};
+use crate::provider::{AuthStyle, DiscoveryState, Provider};
 use crate::router::Registry;
+use crate::sigv4::SigV4Signer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiModel {
@@ -64,7 +65,10 @@ impl DiscoveryCache {
         Ok(list)
     }
 
-    pub async fn get_detailed_models(&self, registry: &Arc<Registry>) -> Result<Vec<ProviderModelInfo>> {
+    pub async fn get_detailed_models(
+        &self,
+        registry: &Arc<Registry>,
+    ) -> Result<Vec<ProviderModelInfo>> {
         let (_, details) = self.get_or_refresh(registry).await?;
         Ok(details)
     }
@@ -133,6 +137,8 @@ impl DiscoveryCache {
                 match res {
                     Ok(Ok(discovered_models)) => {
                         prov_health.discovery = DiscoveryState::Live;
+                        prov_health.is_failed = false;
+                        prov_health.consecutive_failures = 0;
                         drop(prov_health);
 
                         for dm in discovered_models {
@@ -180,17 +186,29 @@ impl DiscoveryCache {
                                 );
                             }
 
-                            new_canonical.insert(canonical_id.clone(), (prov_id.clone(), upstream_id.clone()));
-                            new_bare.entry(upstream_id.clone()).or_default().push(canonical_id.clone());
+                            new_canonical.insert(
+                                canonical_id.clone(),
+                                (prov_id.clone(), upstream_id.clone()),
+                            );
+                            new_bare
+                                .entry(upstream_id.clone())
+                                .or_default()
+                                .push(canonical_id.clone());
                         }
                     }
                     Ok(Err(e)) => {
                         warn!("Discovery for provider '{}' failed: {}", prov_id, e);
+                        prov_health.last_failure =
+                            Some((std::time::Instant::now(), format!("Discovery: {}", e)));
                         prov_health.discovery = DiscoveryState::Failed(e.to_string());
+                        prov_health.is_failed = true;
                     }
                     Err(_) => {
                         warn!("Discovery for provider '{}' timed out", prov_id);
+                        prov_health.last_failure =
+                            Some((std::time::Instant::now(), "Discovery: timeout".to_string()));
                         prov_health.discovery = DiscoveryState::Failed("timeout".to_string());
+                        prov_health.is_failed = true;
                     }
                 }
 
@@ -267,34 +285,147 @@ impl DiscoveryCache {
 }
 
 pub async fn fetch_provider_models(prov: &Provider) -> Result<Vec<OpenAiModel>> {
+    match &prov.auth {
+        AuthStyle::AwsSigv4 { region, .. } => fetch_bedrock_foundation_models(prov, region).await,
+        _ => fetch_openai_compatible_models(prov).await,
+    }
+}
+
+async fn fetch_bedrock_foundation_models(
+    prov: &Provider,
+    region: &str,
+) -> Result<Vec<OpenAiModel>> {
+    let host = format!("bedrock.{}.amazonaws.com", region);
+    let uri_str = format!("https://{}/foundation-models", host);
+    let creds = prov.token_cache.get_aws_credentials().await?;
+    let signer = SigV4Signer::new("bedrock", region, &creds);
+
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert(
+        hyper::header::HOST,
+        hyper::header::HeaderValue::from_str(&host)?,
+    );
+    headers.insert(
+        hyper::header::CONTENT_TYPE,
+        hyper::header::HeaderValue::from_static("application/json"),
+    );
+
+    signer.sign_request(
+        "GET",
+        "/foundation-models",
+        None,
+        &mut headers,
+        &[],
+        chrono::Utc::now(),
+    )?;
+
+    let mut req_builder = Request::builder().method(Method::GET).uri(uri_str);
+    for (k, v) in headers.iter() {
+        req_builder = req_builder.header(k, v);
+    }
+
+    let req = req_builder.body(hyper::Body::empty())?;
+    tracing::info!(
+        "Fetching models for provider '{}' from URI: {}",
+        prov.id,
+        req.uri()
+    );
+    let resp = prov.client.request(req).await?;
+    tracing::info!(
+        "Provider '{}' discovery response status: {}",
+        prov.id,
+        resp.status()
+    );
+
+    if !resp.status().is_success() {
+        anyhow::bail!("Bedrock discovery returned status {}", resp.status());
+    }
+
+    let body = to_bytes(resp.into_body()).await?;
+    let json: serde_json::Value = serde_json::from_slice(&body)?;
+
+    let mut models = Vec::new();
+    if let Some(summaries) = json["modelSummaries"].as_array() {
+        for s in summaries {
+            if let Some(id) = s["modelId"].as_str() {
+                let is_active = s["modelLifecycle"]["status"].as_str() == Some("ACTIVE");
+                if is_active {
+                    models.push(OpenAiModel {
+                        id: id.to_string(),
+                        object: "model".to_string(),
+                        created: 1700000000,
+                        owned_by: prov.id.clone(),
+                        context_window: s["inputModalities"].as_array().map(|_| 128000),
+                        max_output_tokens: Some(4096),
+                        supports_tools: Some(true),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(models)
+}
+
+async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiModel>> {
+    tracing::info!(
+        "Starting fetch_openai_compatible_models for provider '{}'",
+        prov.id
+    );
     let base = prov.base_url.trim_end_matches('/');
-    let uri_str = if base.ends_with("/v1") || base.ends_with("/openai") || base.contains("/v1/") || base.contains("/openai/") {
+    let uri_str = if base.ends_with("/v1")
+        || base.ends_with("/openai")
+        || base.contains("/v1/")
+        || base.contains("/openai/")
+    {
         format!("{}://{}/models", prov.scheme, base)
     } else {
         format!("{}://{}/v1/models", prov.scheme, base)
     };
 
-    let mut req_builder = Request::builder().method(Method::GET).uri(uri_str);
+    let uri: hyper::Uri = uri_str.parse()?;
+    let mut req_builder = Request::builder().method(Method::GET).uri(uri);
 
     match &prov.auth {
         crate::provider::AuthStyle::OauthM2m { .. } => {
-            let bearer = prov.token_cache.get_valid_bearer().await.unwrap_or_default();
+            let bearer = prov
+                .token_cache
+                .get_valid_bearer()
+                .await
+                .unwrap_or_default();
             let x_api_key = prov.token_cache.get_x_api_key().await.unwrap_or_default();
             if !bearer.is_empty() {
-                req_builder = req_builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", bearer));
+                req_builder =
+                    req_builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", bearer));
             }
             if !x_api_key.is_empty() {
                 req_builder = req_builder.header("x-apikey", x_api_key);
             }
         }
-        crate::provider::AuthStyle::BearerApiKey { .. } | crate::provider::AuthStyle::StaticBearer { .. } => {
-            let bearer = prov.token_cache.get_valid_bearer().await.unwrap_or_default();
-            let x_api_key = prov.token_cache.get_x_api_key().await.unwrap_or_default();
-            if !bearer.is_empty() {
-                req_builder = req_builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", bearer));
-            }
-            if !x_api_key.is_empty() {
-                req_builder = req_builder.header("x-apikey", x_api_key);
+        crate::provider::AuthStyle::BearerApiKey { .. }
+        | crate::provider::AuthStyle::StaticBearer { .. } => {
+            let bearer = prov
+                .token_cache
+                .get_valid_bearer()
+                .await
+                .ok()
+                .unwrap_or_default();
+            let x_api_key = prov
+                .token_cache
+                .get_x_api_key()
+                .await
+                .ok()
+                .unwrap_or_default();
+            let auth_token = if !bearer.is_empty() {
+                bearer
+            } else {
+                x_api_key
+            };
+            if !auth_token.is_empty() {
+                req_builder = req_builder.header(
+                    hyper::header::AUTHORIZATION,
+                    format!("Bearer {}", auth_token),
+                );
             }
         }
         crate::provider::AuthStyle::CustomHeader { name, .. } => {
@@ -303,14 +434,32 @@ pub async fn fetch_provider_models(prov: &Provider) -> Result<Vec<OpenAiModel>> 
                 req_builder = req_builder.header(name.as_str(), val);
             }
         }
-        crate::provider::AuthStyle::None => {}
+        crate::provider::AuthStyle::AwsSigv4 { .. } | crate::provider::AuthStyle::None => {}
     }
 
     let host_only = prov.base_url.split('/').next().unwrap_or(&prov.base_url);
     req_builder = req_builder.header(hyper::header::HOST, host_only);
 
     let req = req_builder.body(hyper::Body::empty())?;
-    let resp = prov.client.request(req).await?;
+    tracing::info!(
+        "Sending discovery request for provider '{}' to URI: {}",
+        prov.id,
+        req.uri()
+    );
+    let resp = match prov.client.request(req).await {
+        Ok(r) => {
+            tracing::info!(
+                "Received discovery response for '{}' status: {}",
+                prov.id,
+                r.status()
+            );
+            r
+        }
+        Err(e) => {
+            tracing::warn!("Failed client.request for '{}': {}", prov.id, e);
+            return Err(e.into());
+        }
+    };
 
     if !resp.status().is_success() {
         anyhow::bail!("Status {}", resp.status());

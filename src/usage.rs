@@ -5,7 +5,6 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficClass {
     Billable,
@@ -115,7 +114,10 @@ impl UsageStore {
         let value: serde_json::Value = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse usage store JSON: {}", path.display()))?;
 
-        let version = value.get("schema_version").and_then(|v| v.as_u64()).unwrap_or(1);
+        let version = value
+            .get("schema_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
         if version >= 2 {
             let data: UsageStoreData = serde_json::from_value(value)?;
             return Ok(data);
@@ -163,7 +165,8 @@ impl UsageStore {
         cost: Option<(f64, String)>,
         tokens: BTreeMap<String, u64>,
     ) -> Result<()> {
-        self.record_with_provider(group, "default", model, cost, None, tokens).await
+        self.record_with_provider(group, "default", model, cost, None, tokens)
+            .await
     }
 
     pub async fn record_with_provider(
@@ -186,13 +189,22 @@ impl UsageStore {
         group_entry.requests += 1;
 
         // Group-level flat model entry for backwards compatibility & quick lookup
-        let model_usage = group_entry.models.entry(canonical_model.to_string()).or_default();
+        let model_usage = group_entry
+            .models
+            .entry(canonical_model.to_string())
+            .or_default();
         model_usage.requests += 1;
 
         // Provider-level model entry
-        let provider_entry = group_entry.providers.entry(provider.to_string()).or_default();
+        let provider_entry = group_entry
+            .providers
+            .entry(provider.to_string())
+            .or_default();
         provider_entry.requests += 1;
-        let prov_model_usage = provider_entry.models.entry(canonical_model.to_string()).or_default();
+        let prov_model_usage = provider_entry
+            .models
+            .entry(canonical_model.to_string())
+            .or_default();
         prov_model_usage.requests += 1;
 
         if let Some((amount, currency)) = cost_reported {
@@ -206,15 +218,24 @@ impl UsageStore {
 
         if let Some((amount, currency)) = cost_estimated {
             if amount > 0.0 {
-                *model_usage.cost_estimated.entry(currency.clone()).or_default() += amount;
-                *prov_model_usage.cost_estimated.entry(currency.clone()).or_default() += amount;
+                *model_usage
+                    .cost_estimated
+                    .entry(currency.clone())
+                    .or_default() += amount;
+                *prov_model_usage
+                    .cost_estimated
+                    .entry(currency.clone())
+                    .or_default() += amount;
             }
         }
 
         for (token_type, count) in tokens {
             if count > 0 {
                 *model_usage.tokens.entry(token_type.clone()).or_default() += count;
-                *prov_model_usage.tokens.entry(token_type.clone()).or_default() += count;
+                *prov_model_usage
+                    .tokens
+                    .entry(token_type.clone())
+                    .or_default() += count;
                 *group_entry
                     .totals
                     .entry(format!("{}_tokens", token_type))

@@ -93,16 +93,22 @@ impl PricingRegistry {
             return HashMap::new();
         }
         match std::fs::read_to_string(path) {
-            Ok(content) => match serde_json::from_str::<HashMap<String, LiteLlmModelEntry>>(&content) {
-                Ok(entries) => {
-                    info!("Loaded {} pricing entries from disk cache {:?}", entries.len(), path);
-                    entries
+            Ok(content) => {
+                match serde_json::from_str::<HashMap<String, LiteLlmModelEntry>>(&content) {
+                    Ok(entries) => {
+                        info!(
+                            "Loaded {} pricing entries from disk cache {:?}",
+                            entries.len(),
+                            path
+                        );
+                        entries
+                    }
+                    Err(e) => {
+                        warn!("Failed to parse pricing cache {:?}: {}", path, e);
+                        HashMap::new()
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to parse pricing cache {:?}: {}", path, e);
-                    HashMap::new()
-                }
-            },
+            }
             Err(e) => {
                 warn!("Failed to read pricing cache {:?}: {}", path, e);
                 HashMap::new()
@@ -111,7 +117,10 @@ impl PricingRegistry {
     }
 
     pub async fn fetch_latest(&self) -> Result<usize> {
-        info!("Fetching dynamic model price catalog from {}", LITELLM_PRICES_URL);
+        info!(
+            "Fetching dynamic model price catalog from {}",
+            LITELLM_PRICES_URL
+        );
         let uri: Uri = LITELLM_PRICES_URL.parse()?;
         let req = Request::builder()
             .method(Method::GET)
@@ -126,7 +135,7 @@ impl PricingRegistry {
 
         let bytes = to_bytes(resp.into_body()).await?;
         let raw_map: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
-        
+
         let mut parsed = HashMap::new();
         for (key, val) in raw_map {
             if key == "sample_spec" {
@@ -153,11 +162,17 @@ impl PricingRegistry {
         }
         if let Ok(json_str) = serde_json::to_string(&parsed) {
             if let Err(e) = std::fs::write(&self.cache_path, json_str) {
-                warn!("Failed to persist pricing cache to {:?}: {}", self.cache_path, e);
+                warn!(
+                    "Failed to persist pricing cache to {:?}: {}",
+                    self.cache_path, e
+                );
             }
         }
 
-        info!("Successfully updated model price catalog ({} models)", count);
+        info!(
+            "Successfully updated model price catalog ({} models)",
+            count
+        );
         Ok(count)
     }
 
@@ -168,7 +183,9 @@ impl PricingRegistry {
         let normalized_keys = Self::candidate_keys(model);
         for key in &normalized_keys {
             if let Some(entry) = guard.get(key) {
-                if let (Some(in_cost), Some(out_cost)) = (entry.input_cost_per_token, entry.output_cost_per_token) {
+                if let (Some(in_cost), Some(out_cost)) =
+                    (entry.input_cost_per_token, entry.output_cost_per_token)
+                {
                     let in_1m = in_cost * 1_000_000.0;
                     let out_1m = out_cost * 1_000_000.0;
                     return Some((in_1m, out_1m, entry.currency.clone()));
@@ -185,10 +202,7 @@ impl PricingRegistry {
         candidates.push(clean.to_string());
 
         // Strip provider prefix e.g. "google_test/gemini-3.6-flash" -> "gemini-3.6-flash"
-        let without_prov = clean
-            .split_once('/')
-            .map(|(_, m)| m)
-            .unwrap_or(clean);
+        let without_prov = clean.split_once('/').map(|(_, m)| m).unwrap_or(clean);
 
         if without_prov != clean {
             candidates.push(without_prov.to_string());
@@ -206,7 +220,9 @@ impl PricingRegistry {
 
         // Version fallback logic: e.g., gemini-3.6-flash -> gemini-2.5-flash fallback if not listed yet
         if without_prov.starts_with("gemini-3.") {
-            let fallback_flash = without_prov.replace("gemini-3.6-flash", "gemini-2.5-flash").replace("gemini-3.5-flash", "gemini-2.5-flash");
+            let fallback_flash = without_prov
+                .replace("gemini-3.6-flash", "gemini-2.5-flash")
+                .replace("gemini-3.5-flash", "gemini-2.5-flash");
             candidates.push(fallback_flash.clone());
             candidates.push(format!("gemini/{}", fallback_flash));
         }
