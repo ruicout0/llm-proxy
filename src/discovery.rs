@@ -60,6 +60,13 @@ impl DiscoveryCache {
         }
     }
 
+    pub async fn refresh(&self, registry: &Arc<Registry>) -> Result<()> {
+        let (list, details) = self.fetch_all(registry).await?;
+        let mut guard = self.cached_response.write().await;
+        *guard = Some((Instant::now(), list, details));
+        Ok(())
+    }
+
     pub async fn get_models(&self, registry: &Arc<Registry>) -> Result<OpenAiModelsList> {
         let (list, _) = self.get_or_refresh(registry).await?;
         Ok(list)

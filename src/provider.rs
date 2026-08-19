@@ -745,9 +745,9 @@ impl TokenCache {
         {
             let prof_text = profile.unwrap_or("default");
             let aws_cmd = if prof_text == "default" {
-                "aws sso login".to_string()
+                "aws sso login && osascript -e 'tell application \\\"Terminal\\\" to close (every window whose name contains \\\"aws sso login\\\")' 2>/dev/null || exit".to_string()
             } else {
-                format!("aws sso login --profile {}", prof_text)
+                format!("aws sso login --profile {} && osascript -e 'tell application \\\"Terminal\\\" to close (every window whose name contains \\\"aws sso login\\\")' 2>/dev/null || exit", prof_text)
             };
             let script = format!(
                 r#"try
