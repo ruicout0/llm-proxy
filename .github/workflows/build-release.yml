@@ -15,6 +15,8 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
+    env:
+      MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
     strategy:
       fail-fast: false
       matrix:
@@ -26,10 +28,6 @@ jobs:
           - name: linux-aarch64
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            archive: tar.gz
-          - name: macos-x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
             archive: tar.gz
           - name: macos-aarch64
             runner: macos-14
@@ -63,6 +61,40 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Code Sign macOS binary
+        if: matrix.target == 'aarch64-apple-darwin' && env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 12)
+          cleanup() {
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+            rm -f "$CERT_PATH"
+          }
+          trap cleanup EXIT
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          printf '%s' "$MACOS_CERTIFICATE" | tr -d '[:space:]' | base64 -D > "$CERT_PATH"
+          openssl pkcs12 -in "$CERT_PATH" -passin env:MACOS_CERTIFICATE_PWD -noout
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          codesign \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "com.ruicouto.codesign" \
+            --identifier com.ruicouto.llm-proxy \
+            --force \
+            "target/${{ matrix.target }}/release/llm-proxy"
 
       - name: Smoke test binary (Unix)
         if: runner.os != 'Windows'
