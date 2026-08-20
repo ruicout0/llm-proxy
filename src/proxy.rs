@@ -7,11 +7,12 @@ use hyper::header::{HeaderValue, AUTHORIZATION, CACHE_CONTROL};
 use hyper::{Body, Method, Request, Response, StatusCode};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::dialect::{
-    resolve_bedrock_inference_profile_id, transform_bedrock_to_openai, transform_openai_to_bedrock,
-    Dialect, EventStreamDecoder,
+    normalize_upstream_error_response, resolve_bedrock_inference_profile_id,
+    sanitize_openai_request, sanitize_openai_response, sanitize_sse_chunk,
+    transform_bedrock_to_openai, transform_openai_to_bedrock, Dialect, EventStreamDecoder,
 };
 use crate::discovery::DiscoveryCache;
 use crate::pricing::PricingRegistry;
@@ -207,6 +208,14 @@ pub async fn handle_request(
         .get("x-llm-provider")
         .and_then(|v| v.to_str().ok());
 
+    info!(
+        "Incoming request: {} {} raw_model={:?}",
+        method, path_and_query, raw_request_model
+    );
+    if let Some(ref json_val) = parsed_body {
+        info!("Request payload: {}", serde_json::to_string(json_val).unwrap_or_default());
+    }
+
     // 4. Resolve Route
     let route = match registry
         .resolve_route(raw_request_model.as_deref(), header_provider)
@@ -264,9 +273,11 @@ pub async fn handle_request(
         }
     } else {
         // OpenAI standard rewriting: set model to upstream_model and inject stream_options
+        let mut final_bytes = body_bytes.clone();
         if let Some(ref mut v) = parsed_body {
             if v.is_object() {
                 v["model"] = serde_json::Value::String(upstream_model.clone());
+                sanitize_openai_request(v, &provider.base_url);
 
                 if is_stream {
                     let opts = v.get_mut("stream_options").and_then(|o| o.as_object_mut());
@@ -280,11 +291,11 @@ pub async fn handle_request(
                     }
                 }
                 if let Ok(new_bytes) = serde_json::to_vec(v) {
-                    body_bytes = Bytes::from(new_bytes);
+                    final_bytes = Bytes::from(new_bytes);
                 }
             }
         }
-        (path_and_query.clone(), body_bytes.clone())
+        (path_and_query.clone(), final_bytes)
     };
 
     // 6. Build upstream URI
@@ -353,6 +364,12 @@ pub async fn handle_request(
                             AUTHORIZATION,
                             HeaderValue::from_str(&format!("Bearer {}", key))?,
                         );
+                        if provider.base_url.contains("googleapis.com") {
+                            req_builder = req_builder.header(
+                                "x-api-key".parse::<hyper::header::HeaderName>()?,
+                                HeaderValue::from_str(&key)?,
+                            );
+                        }
                     }
                 }
                 AuthStyle::StaticBearer { .. } => {
@@ -435,6 +452,7 @@ pub async fn handle_request(
 
     let result = match send_upstream(provider.clone()).await {
         Ok::<Response<Body>, anyhow::Error>(resp) => {
+            info!("Upstream response status: {}", resp.status());
             if resp.status() == StatusCode::UNAUTHORIZED
                 && !matches!(provider.auth, AuthStyle::AwsSigv4 { .. })
             {
@@ -649,7 +667,8 @@ pub async fn record_usage_from_response(
                             // Continue loop to emit queued chunks
                             continue;
                         } else {
-                            return Some((Ok::<Bytes, hyper::Error>(chunk), state));
+                            let clean_chunk = sanitize_sse_chunk(&chunk, &state.canonical_model);
+                            return Some((Ok::<Bytes, hyper::Error>(Bytes::from(clean_chunk)), state));
                         }
                     }
                     Some(Err(e)) => return Some((Err(e), state)),

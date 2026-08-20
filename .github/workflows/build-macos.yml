@@ -47,13 +47,6 @@ jobs:
       - name: Build release binary (aarch64 / Apple Silicon)
         run: cargo build --release --target aarch64-apple-darwin
 
-      - name: Test binary runs (x86_64)
-        run: ./target/x86_64-apple-darwin/release/llm-proxy --help
-
-      - name: Test binary runs (aarch64)
-        if: runner.arch == 'ARM64'
-        run: ./target/aarch64-apple-darwin/release/llm-proxy --help
-
       - name: Create universal binary
         run: |
           mkdir -p target/universal/release
@@ -63,6 +56,39 @@ jobs:
             target/aarch64-apple-darwin/release/llm-proxy
           chmod +x target/universal/release/llm-proxy
         shell: bash
+
+      - name: Code Sign Binaries
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 12)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          # Sign all binary slices with custom domain identity and bundle identifier
+          codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/x86_64-apple-darwin/release/llm-proxy
+          codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/aarch64-apple-darwin/release/llm-proxy
+          codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/universal/release/llm-proxy
+
+          security delete-keychain "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      - name: Test binary runs (x86_64)
+        run: ./target/x86_64-apple-darwin/release/llm-proxy --help
+
+      - name: Test binary runs (aarch64)
+        if: runner.arch == 'ARM64'
+        run: ./target/aarch64-apple-darwin/release/llm-proxy --help
 
       - name: Test universal binary
         run: ./target/universal/release/llm-proxy --help
