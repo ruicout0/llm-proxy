@@ -66,6 +66,24 @@ cargo build --release
 cp target/release/llm-proxy ~/.local/bin/
 ```
 
+On macOS, local release binaries are unsigned by default. If macOS blocks the binary, remove the quarantine attribute before running it:
+
+```bash
+xattr -d com.apple.quarantine target/release/llm-proxy 2>/dev/null || true
+```
+
+If you have a valid Apple code-signing identity installed, you can sign a local build yourself:
+
+```bash
+codesign --force \
+  --sign "YOUR APPLE SIGNING IDENTITY" \
+  --identifier com.ruicouto.llm-proxy \
+  target/release/llm-proxy
+codesign --verify --verbose target/release/llm-proxy
+```
+
+Replace `YOUR APPLE SIGNING IDENTITY` with the name shown by `security find-identity -v -p codesigning`. A self-signed certificate is not trusted by macOS Gatekeeper.
+
 #### Prebuilt binaries
 
 Tagged releases publish checksummed archives for Linux (`x86_64` and `aarch64`), macOS Apple Silicon (`aarch64`), and Windows (`x86_64`). Download the archive matching your platform from the [Releases](https://github.com/ruicout0/llm-proxy/releases) page, extract it, and place `llm-proxy` (or `llm-proxy.exe`) on your `PATH`.
@@ -78,6 +96,22 @@ shasum -a 256 -c SHA256SUMS.txt   # macOS
 ```
 
 On Windows PowerShell, use `Get-FileHash .\\llm-proxy-windows-x86_64.exe -Algorithm SHA256` and compare the result with `SHA256SUMS.txt`.
+
+The macOS release binary is currently unsigned because this project does not have an Apple Developer signing certificate. After extracting it, make it executable and run it:
+
+```bash
+chmod +x llm-proxy
+./llm-proxy --help
+```
+
+If macOS reports that it cannot verify the developer, use **Control-click → Open** in Finder and confirm the prompt. For a terminal-only workflow, remove the quarantine attribute instead:
+
+```bash
+xattr -d com.apple.quarantine ./llm-proxy
+./llm-proxy --help
+```
+
+Only remove quarantine from an archive you downloaded from a source you trust, and verify its checksum first.
 
 ## CLI & Service Management Commands
 
