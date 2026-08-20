@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
-use hyper::body::to_bytes;
-use hyper::client::connect::Connection;
-use hyper::service::Service;
-use hyper::Client;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::rt::{Read, Write};
 use hyper::{Method, Request, Uri};
 use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::client::legacy::Client;
 use keyring::Entry;
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
@@ -25,18 +27,51 @@ use crate::sigv4::AwsCredentials;
 pub const KEYCHAIN_SERVICE: &str = "llm-proxy";
 
 // No-op TLS certificate verifier for internal/self-signed certs
+#[derive(Debug)]
 pub struct NoopVerifier;
-impl rustls::client::ServerCertVerifier for NoopVerifier {
+impl rustls::client::danger::ServerCertVerifier for NoopVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> std::result::Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
     }
 }
 
@@ -114,7 +149,10 @@ pub struct Provider {
     pub scheme: String,
     pub auth: AuthStyle,
     pub dialect: Dialect,
-    pub client: Client<HttpsConnector<ProxyConnector>>,
+    pub client: Client<
+        HttpsConnector<ProxyConnector>,
+        http_body_util::combinators::BoxBody<hyper::body::Bytes, hyper::Error>,
+    >,
     pub token_cache: Arc<TokenCache>,
     pub models: BTreeMap<String, ModelSpec>,
     pub health: RwLock<ProviderHealth>,
@@ -394,13 +432,54 @@ impl AsyncWrite for MaybeProxiedStream {
     }
 }
 
-impl Connection for MaybeProxiedStream {
-    fn connected(&self) -> hyper::client::connect::Connected {
-        hyper::client::connect::Connected::new()
+impl Read for MaybeProxiedStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let (result, filled_len) = {
+            let mut read_buf = unsafe { ReadBuf::uninit(buf.as_mut()) };
+            let result = Pin::new(&mut this.stream).poll_read(cx, &mut read_buf);
+            (result, read_buf.filled().len())
+        };
+        if result.is_ready() && filled_len > 0 {
+            unsafe { buf.advance(filled_len) };
+        }
+        result
     }
 }
 
-impl Service<Uri> for ProxyConnector {
+impl Write for MaybeProxiedStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        false
+    }
+}
+
+impl Connection for MaybeProxiedStream {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+impl tower::Service<Uri> for ProxyConnector {
     type Response = MaybeProxiedStream;
     type Error = std::io::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -482,28 +561,31 @@ impl Service<Uri> for ProxyConnector {
 fn build_http_client(
     insecure_skip_tls_verify: bool,
     ca_cert_path: Option<&str>,
-) -> Result<Client<HttpsConnector<ProxyConnector>>> {
+) -> Result<
+    Client<
+        HttpsConnector<ProxyConnector>,
+        http_body_util::combinators::BoxBody<hyper::body::Bytes, hyper::Error>,
+    >,
+> {
+    let crypto_provider = rustls::crypto::ring::default_provider();
     let client_config = if insecure_skip_tls_verify {
         info!("WARNING: TLS certificate verification disabled for upstream connections");
-        rustls::ClientConfig::builder()
-            .with_safe_defaults()
+        rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+            .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoopVerifier))
             .with_no_client_auth()
     } else {
         let mut root_store = rustls::RootCertStore::empty();
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         if let Some(cert_path) = ca_cert_path {
             if let Ok(cert_data) = std::fs::read(cert_path) {
-                if let Ok(certs) = rustls_pemfile::certs(&mut &cert_data[..]) {
+                if let Ok(certs) =
+                    CertificateDer::pem_slice_iter(&cert_data).collect::<Result<Vec<_>, _>>()
+                {
                     for cert in certs {
-                        root_store.add(&rustls::Certificate(cert)).ok();
+                        root_store.add(cert).ok();
                     }
                     info!("Loaded custom CA certificate from: {}", cert_path);
                 } else {
@@ -514,8 +596,8 @@ fn build_http_client(
             }
         }
 
-        rustls::ClientConfig::builder()
-            .with_safe_defaults()
+        rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
             .with_root_certificates(root_store)
             .with_no_client_auth()
     };
@@ -527,7 +609,7 @@ fn build_http_client(
         .enable_http1()
         .wrap_connector(proxy_conn);
 
-    Ok(Client::builder()
+    Ok(Client::builder(hyper_util::rt::TokioExecutor::new())
         .pool_idle_timeout(Duration::from_secs(90))
         .pool_max_idle_per_host(4)
         .build(https))
@@ -541,7 +623,10 @@ pub struct CachedAwsCreds {
 pub struct TokenCache {
     pub provider_id: String,
     pub auth: AuthStyle,
-    pub client: Client<HttpsConnector<ProxyConnector>>,
+    pub client: Client<
+        HttpsConnector<ProxyConnector>,
+        http_body_util::combinators::BoxBody<hyper::body::Bytes, hyper::Error>,
+    >,
     bearer_token: RwLock<Option<(String, Instant)>>,
     x_api_key: RwLock<Option<String>>,
     aws_creds: RwLock<Option<CachedAwsCreds>>,
@@ -551,7 +636,10 @@ impl TokenCache {
     pub fn new(
         provider_id: String,
         auth: AuthStyle,
-        client: Client<HttpsConnector<ProxyConnector>>,
+        client: Client<
+            HttpsConnector<ProxyConnector>,
+            http_body_util::combinators::BoxBody<hyper::body::Bytes, hyper::Error>,
+        >,
     ) -> Self {
         Self {
             provider_id,
@@ -957,14 +1045,18 @@ end try"#,
                     .method(Method::POST)
                     .uri(url)
                     .header("content-type", "application/x-www-form-urlencoded")
-                    .body(hyper::Body::from(body_str))?;
+                    .body(
+                        Full::new(Bytes::from(body_str))
+                            .map_err(|e| match e {})
+                            .boxed(),
+                    )?;
 
                 let resp = self.client.request(req).await?;
                 if !resp.status().is_success() {
                     anyhow::bail!("OAuth token request failed with status: {}", resp.status());
                 }
 
-                let bytes = to_bytes(resp.into_body()).await?;
+                let bytes = BodyExt::collect(resp.into_body()).await?.to_bytes();
                 let json: serde_json::Value = serde_json::from_slice(&bytes)?;
                 let token = json["access_token"]
                     .as_str()

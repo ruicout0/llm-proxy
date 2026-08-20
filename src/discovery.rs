@@ -1,6 +1,8 @@
 use anyhow::Result;
-use hyper::body::to_bytes;
-use hyper::{Method, Request};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, HOST};
+use hyper::{Method, Request, Uri};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -307,15 +309,9 @@ async fn fetch_bedrock_foundation_models(
     let creds = prov.token_cache.get_aws_credentials().await?;
     let signer = SigV4Signer::new("bedrock", region, &creds);
 
-    let mut headers = hyper::HeaderMap::new();
-    headers.insert(
-        hyper::header::HOST,
-        hyper::header::HeaderValue::from_str(&host)?,
-    );
-    headers.insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("application/json"),
-    );
+    let mut headers = HeaderMap::new();
+    headers.insert(HOST, HeaderValue::from_str(&host)?);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
     signer.sign_request(
         "GET",
@@ -331,7 +327,7 @@ async fn fetch_bedrock_foundation_models(
         req_builder = req_builder.header(k, v);
     }
 
-    let req = req_builder.body(hyper::Body::empty())?;
+    let req = req_builder.body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())?;
     tracing::info!(
         "Fetching models for provider '{}' from URI: {}",
         prov.id,
@@ -348,7 +344,7 @@ async fn fetch_bedrock_foundation_models(
         anyhow::bail!("Bedrock discovery returned status {}", resp.status());
     }
 
-    let body = to_bytes(resp.into_body()).await?;
+    let body = resp.into_body().collect().await?.to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body)?;
 
     let mut models = Vec::new();
@@ -390,7 +386,7 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
         format!("{}://{}/v1/models", prov.scheme, base)
     };
 
-    let uri: hyper::Uri = uri_str.parse()?;
+    let uri: Uri = uri_str.parse()?;
     let mut req_builder = Request::builder().method(Method::GET).uri(uri);
 
     match &prov.auth {
@@ -402,8 +398,7 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
                 .unwrap_or_default();
             let x_api_key = prov.token_cache.get_x_api_key().await.unwrap_or_default();
             if !bearer.is_empty() {
-                req_builder =
-                    req_builder.header(hyper::header::AUTHORIZATION, format!("Bearer {}", bearer));
+                req_builder = req_builder.header(AUTHORIZATION, format!("Bearer {}", bearer));
             }
             if !x_api_key.is_empty() {
                 req_builder = req_builder.header("x-apikey", x_api_key);
@@ -429,10 +424,7 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
                 x_api_key
             };
             if !auth_token.is_empty() {
-                req_builder = req_builder.header(
-                    hyper::header::AUTHORIZATION,
-                    format!("Bearer {}", auth_token),
-                );
+                req_builder = req_builder.header(AUTHORIZATION, format!("Bearer {}", auth_token));
             }
         }
         crate::provider::AuthStyle::CustomHeader { name, .. } => {
@@ -445,9 +437,9 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
     }
 
     let host_only = prov.base_url.split('/').next().unwrap_or(&prov.base_url);
-    req_builder = req_builder.header(hyper::header::HOST, host_only);
+    req_builder = req_builder.header(HOST, host_only);
 
-    let req = req_builder.body(hyper::Body::empty())?;
+    let req = req_builder.body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())?;
     tracing::info!(
         "Sending discovery request for provider '{}' to URI: {}",
         prov.id,
@@ -472,7 +464,7 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
         anyhow::bail!("Status {}", resp.status());
     }
 
-    let body = to_bytes(resp.into_body()).await?;
+    let body = resp.into_body().collect().await?.to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body)?;
 
     let mut models = Vec::new();

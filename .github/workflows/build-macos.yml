@@ -1,11 +1,8 @@
-name: Build macOS Binary
+name: Build macOS Binary (legacy)
 
+# Release builds are handled by build-release.yml. Keep this workflow available
+# for manually requested macOS-only builds.
 on:
-  push:
-    branches: [main, master]
-    tags: ['v*']
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
 
 env:
@@ -63,14 +60,24 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
+          set -euo pipefail
+
           KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
           KEYCHAIN_PASSWORD=$(openssl rand -hex 12)
+          cleanup() {
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+            rm -f "$CERT_PATH"
+          }
+          trap cleanup EXIT
+
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          CERT_PATH=$RUNNER_TEMP/certificate.p12
-          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          printf '%s' "$MACOS_CERTIFICATE" | tr -d '[:space:]' | base64 -D > "$CERT_PATH"
+          # Validate the PKCS#12 password before importing so a bad secret fails clearly.
+          openssl pkcs12 -in "$CERT_PATH" -passin env:MACOS_CERTIFICATE_PWD -noout
           security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
@@ -78,10 +85,7 @@ jobs:
           # Sign all binary slices with custom domain identity and bundle identifier
           codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/x86_64-apple-darwin/release/llm-proxy
           codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/aarch64-apple-darwin/release/llm-proxy
-          codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/universal/release/llm-proxy
-
-          security delete-keychain "$KEYCHAIN_PATH"
-          rm -f "$CERT_PATH"
+         codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/universal/release/llm-proxy
 
       - name: Test binary runs (x86_64)
         run: ./target/x86_64-apple-darwin/release/llm-proxy --help

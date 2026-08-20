@@ -59,10 +59,25 @@ Traffic bypasses the outbound proxy and connects directly when the target host m
 
 ### 1. Build & Install
 
+For local development:
+
 ```bash
 cargo build --release
 cp target/release/llm-proxy ~/.local/bin/
 ```
+
+#### Prebuilt binaries
+
+Tagged releases publish checksummed archives for Linux (`x86_64`), macOS (`x86_64` and `aarch64`), and Windows (`x86_64`). Download the archive matching your platform from the [Releases](https://github.com/ruicout0/llm-proxy/releases) page, extract it, and place `llm-proxy` (or `llm-proxy.exe`) on your `PATH`.
+
+Verify downloads before installing:
+
+```bash
+sha256sum -c SHA256SUMS.txt       # Linux
+shasum -a 256 -c SHA256SUMS.txt   # macOS
+```
+
+On Windows PowerShell, use `Get-FileHash .\\llm-proxy-windows-x86_64.exe -Algorithm SHA256` and compare the result with `SHA256SUMS.txt`.
 
 ### 2. Configuration Reference (`~/.config/llm-proxy/config.toml`)
 

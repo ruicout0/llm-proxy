@@ -1,10 +1,12 @@
 use anyhow::Result;
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::{stream, StreamExt};
-use hyper::body::to_bytes;
+use futures_util::stream;
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Incoming;
 use hyper::header::{HeaderValue, AUTHORIZATION, CACHE_CONTROL};
-use hyper::{Body, Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -20,11 +22,14 @@ use crate::router::Registry;
 use crate::sigv4::SigV4Signer;
 use crate::usage::{resolve_usage_group, TrafficClass, UsageStore};
 
+// Type alias for response body supporting both buffered and streaming
+type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
 pub fn openai_error_response(
     status: StatusCode,
     message: &str,
     error_type: &str,
-) -> Response<Body> {
+) -> Response<ResponseBody> {
     let error_json = serde_json::json!({
         "error": {
             "message": message,
@@ -37,7 +42,11 @@ pub fn openai_error_response(
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .body(Body::from(body_str))
+        .body(
+            Full::new(Bytes::from(body_str))
+                .map_err(|e| match e {})
+                .boxed(),
+        )
         .unwrap()
 }
 
@@ -58,12 +67,12 @@ pub fn classify_traffic(path_and_query: &str, headers: &hyper::HeaderMap) -> Tra
 }
 
 pub async fn handle_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     registry: Arc<Registry>,
     discovery: Arc<DiscoveryCache>,
     pricing: Arc<PricingRegistry>,
     usage_store: Arc<UsageStore>,
-) -> Result<Response<Body>> {
+) -> Result<Response<ResponseBody>> {
     let method = req.method().clone();
     let path_and_query = req
         .uri()
@@ -82,13 +91,17 @@ pub async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
-            .body(Body::from(body))?);
+            .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())?);
     }
     if method == Method::GET && path_and_query == "/llm-proxy/usage/dashboard" {
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/html; charset=utf-8")
-            .body(Body::from(crate::usage::usage_dashboard_html()))?);
+            .body(
+                Full::new(Bytes::from(crate::usage::usage_dashboard_html()))
+                    .map_err(|e| match e {})
+                    .boxed(),
+            )?);
     }
     if method == Method::GET && path_and_query == "/llm-proxy/models" {
         let details = discovery.get_detailed_models(&registry).await?;
@@ -96,7 +109,7 @@ pub async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
-            .body(Body::from(body))?);
+            .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())?);
     }
     if method == Method::GET && path_and_query.starts_with("/llm-proxy/health") {
         let uri = req.uri();
@@ -134,7 +147,7 @@ pub async fn handle_request(
         return Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
-            .body(Body::from(body))?);
+            .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())?);
     }
 
     // 2. Discovery endpoints
@@ -145,7 +158,7 @@ pub async fn handle_request(
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
                     .header("Content-Type", "application/json")
-                    .body(Body::from(body))?);
+                    .body(Full::new(Bytes::from(body)).map_err(|e| match e {}).boxed())?);
             }
             Err(e) => {
                 return Ok(openai_error_response(
@@ -158,11 +171,8 @@ pub async fn handle_request(
     }
 
     // 3. Buffer request body
-    let (parts, body_bytes) = {
-        let (parts, body) = req.into_parts();
-        let bytes = to_bytes(body).await?;
-        (parts, bytes)
-    };
+    let (parts, body) = req.into_parts();
+    let body_bytes = BodyExt::collect(body).await?.to_bytes();
 
     let group = match traffic_class {
         TrafficClass::Probe => "__probe".to_string(),
@@ -441,9 +451,10 @@ pub async fn handle_request(
                     .header(hyper::header::HOST, HeaderValue::from_str(host_only)?);
             }
 
-            let built_req = req_builder.body(Body::from(body_bytes))?;
+            let built_req =
+                req_builder.body(Full::new(body_bytes).map_err(|e| match e {}).boxed())?;
             let resp = provider.client.request(built_req).await?;
-            Ok::<Response<Body>, anyhow::Error>(resp)
+            Ok::<Response<Incoming>, anyhow::Error>(resp)
         }
     };
 
@@ -453,7 +464,7 @@ pub async fn handle_request(
     );
 
     let result = match send_upstream(provider.clone()).await {
-        Ok::<Response<Body>, anyhow::Error>(resp) => {
+        Ok::<Response<Incoming>, anyhow::Error>(resp) => {
             info!("Upstream response status: {}", resp.status());
             if resp.status() == StatusCode::UNAUTHORIZED
                 && !matches!(provider.auth, AuthStyle::AwsSigv4 { .. })
@@ -597,7 +608,7 @@ pub fn parse_sse_usage(buf: &[u8], request_model: Option<&str>) -> Option<Parsed
 
 #[allow(clippy::too_many_arguments)]
 pub async fn record_usage_from_response(
-    resp: Response<Body>,
+    resp: Response<Incoming>,
     usage_store: Arc<UsageStore>,
     pricing: Arc<PricingRegistry>,
     group: String,
@@ -605,7 +616,7 @@ pub async fn record_usage_from_response(
     canonical_model: String,
     provider: Arc<Provider>,
     is_stream: bool,
-) -> Result<Response<Body>> {
+) -> Result<Response<ResponseBody>> {
     let (mut parts, body) = resp.into_parts();
 
     if is_stream {
@@ -620,7 +631,7 @@ pub async fn record_usage_from_response(
         }
 
         struct TeeState {
-            body: Body,
+            body: Incoming,
             buf: Vec<u8>,
             usage_store: Arc<UsageStore>,
             pricing: Arc<PricingRegistry>,
@@ -654,26 +665,92 @@ pub async fn record_usage_from_response(
                 // If we have converted Bedrock SSE chunks queued, yield them first
                 if !state.pending_sse_chunks.is_empty() {
                     let chunk = state.pending_sse_chunks.remove(0);
-                    return Some((Ok::<Bytes, hyper::Error>(chunk), state));
+                    return Some((
+                        Ok::<hyper::body::Frame<Bytes>, hyper::Error>(hyper::body::Frame::data(
+                            chunk,
+                        )),
+                        state,
+                    ));
                 }
 
-                match state.body.next().await {
-                    Some(Ok(chunk)) => {
-                        state.buf.extend_from_slice(&chunk);
+                match state.body.frame().await {
+                    Some(Ok(frame)) => {
+                        if let Some(chunk) = frame.data_ref() {
+                            state.buf.extend_from_slice(chunk);
 
-                        if state.is_bedrock && state.success {
-                            let sse_lines = state.bedrock_decoder.push_chunk(&chunk);
-                            for line in sse_lines {
-                                state.pending_sse_chunks.push(Bytes::from(line));
+                            if state.is_bedrock && state.success {
+                                let sse_lines = state.bedrock_decoder.push_chunk(chunk);
+                                for line in sse_lines {
+                                    state.pending_sse_chunks.push(Bytes::from(line));
+                                }
+                                // Continue loop to emit queued chunks
+                                continue;
+                            } else {
+                                let clean_chunk = sanitize_sse_chunk(chunk, &state.canonical_model);
+                                return Some((
+                                    Ok::<hyper::body::Frame<Bytes>, hyper::Error>(
+                                        hyper::body::Frame::data(Bytes::from(clean_chunk)),
+                                    ),
+                                    state,
+                                ));
                             }
-                            // Continue loop to emit queued chunks
-                            continue;
-                        } else {
-                            let clean_chunk = sanitize_sse_chunk(&chunk, &state.canonical_model);
-                            return Some((
-                                Ok::<Bytes, hyper::Error>(Bytes::from(clean_chunk)),
-                                state,
-                            ));
+                        } else if frame.data_ref().is_none() {
+                            // End of stream
+                            if state.is_bedrock && state.success {
+                                // Emit terminal [DONE] if not emitted
+                                state
+                                    .pending_sse_chunks
+                                    .push(Bytes::from("data: [DONE]\n\n"));
+                            }
+
+                            if state.success {
+                                let parsed = if state.is_bedrock {
+                                    // For Bedrock, parse usage from the decoded buffer
+                                    parse_sse_usage(&state.buf, Some(&state.canonical_model))
+                                } else {
+                                    parse_sse_usage(&state.buf, Some(&state.canonical_model))
+                                };
+
+                                if let Some((_model, cost_reported, tokens)) = parsed {
+                                    let cost_estimated = if cost_reported.is_none() {
+                                        estimate_cost(
+                                            &tokens,
+                                            &state.provider,
+                                            &state.canonical_model,
+                                            &state.pricing,
+                                        )
+                                        .await
+                                    } else {
+                                        None
+                                    };
+                                    debug!(
+                                        "Recorded streaming usage for group={} prov={} model={} reported={:?} estimated={:?}",
+                                        state.group, state.provider_id, state.canonical_model, cost_reported, cost_estimated
+                                    );
+                                    let _ = state
+                                        .usage_store
+                                        .record_with_provider(
+                                            &state.group,
+                                            &state.provider_id,
+                                            &state.canonical_model,
+                                            cost_reported,
+                                            cost_estimated,
+                                            tokens,
+                                        )
+                                        .await;
+                                }
+                            }
+
+                            if !state.pending_sse_chunks.is_empty() {
+                                let chunk = state.pending_sse_chunks.remove(0);
+                                return Some((
+                                    Ok::<hyper::body::Frame<Bytes>, hyper::Error>(
+                                        hyper::body::Frame::data(chunk),
+                                    ),
+                                    state,
+                                ));
+                            }
+                            return None;
                         }
                     }
                     Some(Err(e)) => return Some((Err(e), state)),
@@ -726,18 +803,26 @@ pub async fn record_usage_from_response(
 
                         if !state.pending_sse_chunks.is_empty() {
                             let chunk = state.pending_sse_chunks.remove(0);
-                            return Some((Ok::<Bytes, hyper::Error>(chunk), state));
+                            return Some((
+                                Ok::<hyper::body::Frame<Bytes>, hyper::Error>(
+                                    hyper::body::Frame::data(chunk),
+                                ),
+                                state,
+                            ));
                         }
                         return None;
                     }
                 }
             }
         });
-        return Ok(Response::from_parts(parts, Body::wrap_stream(out)));
+        return Ok(Response::from_parts(
+            parts,
+            http_body_util::combinators::BoxBody::new(StreamBody::new(out)),
+        ));
     }
 
     // Non-streaming: buffer JSON
-    let body_bytes = to_bytes(body).await?;
+    let body_bytes = BodyExt::collect(body).await?.to_bytes();
 
     let final_body_bytes =
         if provider.dialect == Dialect::BedrockConverse && parts.status.is_success() {
@@ -784,7 +869,10 @@ pub async fn record_usage_from_response(
         }
     }
 
-    Ok(Response::from_parts(parts, Body::from(final_body_bytes)))
+    Ok(Response::from_parts(
+        parts,
+        Full::new(final_body_bytes).map_err(|e| match e {}).boxed(),
+    ))
 }
 
 pub async fn estimate_cost(

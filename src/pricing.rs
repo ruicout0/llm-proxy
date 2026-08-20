@@ -1,11 +1,14 @@
 use anyhow::Result;
 use dirs::home_dir;
-use hyper::body::to_bytes;
-use hyper::{Body, Client, Method, Request, Uri};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::{Method, Request, Uri};
 use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -42,11 +45,14 @@ pub struct PricingRegistry {
     entries: RwLock<HashMap<String, LiteLlmModelEntry>>,
     cache_path: PathBuf,
     last_fetched: RwLock<Option<Instant>>,
-    client: Client<HttpsConnector<ProxyConnector>>,
+    client: Client<
+        HttpsConnector<ProxyConnector>,
+        http_body_util::combinators::BoxBody<hyper::body::Bytes, hyper::Error>,
+    >,
 }
 
 impl PricingRegistry {
-    pub fn new(config: &ConfigFile) -> Self {
+    pub fn new(config: &ConfigFile) -> Result<Self> {
         let cache_path = config
             .pricing_cache_path
             .as_ref()
@@ -56,16 +62,11 @@ impl PricingRegistry {
         let initial_entries = Self::load_cache_from_disk(&cache_path);
 
         let proxy_conn = ProxyConnector::new();
+        let crypto_provider = rustls::crypto::ring::default_provider();
         let mut root_store = rustls::RootCertStore::empty();
-        root_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.0.iter().map(|ta| {
-            rustls::OwnedTrustAnchor::from_subject_spki_name_constraints(
-                ta.subject,
-                ta.spki,
-                ta.name_constraints,
-            )
-        }));
-        let client_config = rustls::ClientConfig::builder()
-            .with_safe_defaults()
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider))
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
             .with_root_certificates(root_store)
             .with_no_client_auth();
 
@@ -75,17 +76,17 @@ impl PricingRegistry {
             .enable_http1()
             .wrap_connector(proxy_conn);
 
-        let client = Client::builder()
+        let client = Client::builder(hyper_util::rt::TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(2)
             .build(https);
 
-        Self {
+        Ok(Self {
             entries: RwLock::new(initial_entries),
             cache_path,
             last_fetched: RwLock::new(None),
             client,
-        }
+        })
     }
 
     fn load_cache_from_disk(path: &PathBuf) -> HashMap<String, LiteLlmModelEntry> {
@@ -126,14 +127,14 @@ impl PricingRegistry {
             .method(Method::GET)
             .uri(uri)
             .header("User-Agent", "llm-proxy/pricing-sync")
-            .body(Body::empty())?;
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())?;
 
         let resp = self.client.request(req).await?;
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch pricing catalog: HTTP {}", resp.status());
         }
 
-        let bytes = to_bytes(resp.into_body()).await?;
+        let bytes = resp.into_body().collect().await?.to_bytes();
         let raw_map: HashMap<String, serde_json::Value> = serde_json::from_slice(&bytes)?;
 
         let mut parsed = HashMap::new();

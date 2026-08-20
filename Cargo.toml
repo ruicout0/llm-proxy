@@ -8,9 +8,12 @@ name = "llm-proxy"
 path = "src/main.rs"
 
 [dependencies]
-hyper = { version = "0.14", features = ["full"] }
-hyper-rustls = "0.24"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "server", "http1", "http2", "tokio"] }
+http-body-util = "0.1"
+hyper-rustls = "0.27"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+tower = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
@@ -24,9 +27,8 @@ keyring = "4.1"
 dirs = "5.0"
 toml = "0.8"
 dialoguer = "0.11"
-rustls = { version = "0.21", features = ["dangerous_configuration"] }
-rustls-pemfile = "1.0"
-webpki-roots = "0.22"
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "0.26"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4.3"

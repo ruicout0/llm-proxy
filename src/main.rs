@@ -13,13 +13,15 @@ pub mod usage;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use hyper::server::Server;
-use hyper::service::{make_service_fn, service_fn};
+use hyper::service::service_fn;
+use hyper::{body::Incoming, Request};
+use hyper_util::rt::TokioIo;
+use hyper_util::server::conn::auto::Builder;
 use keyring::Entry;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{default_usage_store_path, ConfigFile, ProviderConfig};
 use crate::discovery::DiscoveryCache;
@@ -871,7 +873,7 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     let config = load_config(config_file)?;
     let registry = Arc::new(Registry::new(&config));
     let discovery = Arc::new(DiscoveryCache::new(&config));
-    let pricing = Arc::new(PricingRegistry::new(&config));
+    let pricing = Arc::new(PricingRegistry::new(&config)?);
 
     let usage_store_path = config
         .usage_store_path
@@ -923,25 +925,53 @@ async fn run_proxy(config_file: Option<PathBuf>) -> Result<()> {
     info!("LLM proxy listening on {}", addr);
     info!("Configured default provider: {}", registry.default_provider);
 
-    let make_svc = make_service_fn(move |_| {
-        let registry = registry.clone();
-        let discovery = discovery.clone();
-        let pricing = pricing.clone();
-        let usage_store = usage_store.clone();
-        async move {
-            Ok::<_, anyhow::Error>(service_fn(move |req| {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    info!("Server started, waiting for shutdown signal...");
+
+    let graceful = shutdown_signal();
+    tokio::pin!(graceful);
+    let builder = Builder::new(hyper_util::rt::TokioExecutor::new());
+
+    loop {
+        tokio::select! {
+            _ = &mut graceful => {
+                info!("Shutdown signal received, stopping server...");
+                break;
+            }
+            result = listener.accept() => {
+                let (stream, remote_addr) = match result {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to accept connection: {}", e);
+                        continue;
+                    }
+                };
                 let registry = registry.clone();
                 let discovery = discovery.clone();
                 let pricing = pricing.clone();
                 let usage_store = usage_store.clone();
-                async move { handle_request(req, registry, discovery, pricing, usage_store).await }
-            }))
-        }
-    });
+                let builder = builder.clone();
 
-    let server = Server::bind(&addr).serve(make_svc);
-    info!("Server started, waiting for shutdown signal...");
-    server.with_graceful_shutdown(shutdown_signal()).await?;
+                let io = TokioIo::new(stream);
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let registry = registry.clone();
+                    let discovery = discovery.clone();
+                    let pricing = pricing.clone();
+                    let usage_store = usage_store.clone();
+                    async move { handle_request(req, registry, discovery, pricing, usage_store).await }
+                });
+
+                tokio::spawn(async move {
+                    if let Err(e) = builder.serve_connection(io, svc).await {
+                        if remote_addr.ip().is_loopback() {
+                            debug!("Connection error from {}: {}", remote_addr, e);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     info!("Shutdown complete");
     Ok(())
 }
@@ -1612,7 +1642,7 @@ api_key = "openai-key"
             discovery_timeout_ms: 2500,
             providers: vec![],
         };
-        let pricing = PricingRegistry::new(&dummy_cfg);
+        let pricing = PricingRegistry::new(&dummy_cfg).unwrap();
         let p_cfg = ProviderConfig {
             id: "openai".to_string(),
             base_url: "api.openai.com".to_string(),
