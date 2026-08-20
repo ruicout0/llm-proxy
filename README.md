@@ -18,7 +18,7 @@ Lightweight, high-performance local multi-provider LLM reverse proxy written in 
   * **Custom Header (`custom_header`)**: Pass custom API keys like `x-api-key`.
 * **Dynamic Model Discovery & Caching**:
   * Auto-discovers upstream models at startup and periodically refreshes them (`/v1/models` aggregates all available providers).
-  * Fast namespace resolution with configurable separators (e.g., `google_test/gemini-3.7-flash`, `aws-bedrock/eu.amazon.nova-pro-v1:0`, `bmw_llm_api/gpt-4o`).
+  * Fast namespace resolution with configurable separators (e.g., `google/gemini-2.5-flash`, `aws-bedrock/eu.amazon.nova-pro-v1:0`, `openai/gpt-4o`).
 * **Pricing & Usage Tracking**:
   * Real-time SSE streaming cost estimation and token accounting.
   * Syncs with LiteLLM's live model pricing catalog with offline disk caching (`~/.config/llm-proxy/prices_cache.json`).
@@ -51,7 +51,7 @@ Example proxy URL: `http://localhost:3128` or `http://proxy.corp.example.com:808
 Traffic bypasses the outbound proxy and connects directly when the target host matches rules defined in `NO_PROXY` / `no_proxy`:
 * Localhost/Loopback: `localhost`, `127.0.0.1`, `::1` are always bypassed by default.
 * Wildcard bypass: `NO_PROXY=*` forces all connections to be direct.
-* Comma-separated domain/host suffixes: e.g. `NO_PROXY=localhost,127.0.0.1,.bmwgroup.net,.cloud.bmw` will route `.cloud.bmw` and `.bmwgroup.net` directly while routing public endpoints (like `generativelanguage.googleapis.com` or AWS endpoints) through the proxy tunnel.
+* Comma-separated domain/host suffixes: e.g. `NO_PROXY=localhost,127.0.0.1,.internal.example.com` bypasses the proxy for matching internal hosts while routing public endpoints through the proxy tunnel.
 
 ---
 
@@ -68,7 +68,7 @@ cp target/release/llm-proxy ~/.local/bin/
 
 #### Prebuilt binaries
 
-Tagged releases publish checksummed archives for Linux (`x86_64`), macOS (`x86_64` and `aarch64`), and Windows (`x86_64`). Download the archive matching your platform from the [Releases](https://github.com/ruicout0/llm-proxy/releases) page, extract it, and place `llm-proxy` (or `llm-proxy.exe`) on your `PATH`.
+Tagged releases publish checksummed archives for Linux (`x86_64` and `aarch64`), macOS Apple Silicon (`aarch64`), and Windows (`x86_64`). Download the archive matching your platform from the [Releases](https://github.com/ruicout0/llm-proxy/releases) page, extract it, and place `llm-proxy` (or `llm-proxy.exe`) on your `PATH`.
 
 Verify downloads before installing:
 
@@ -79,14 +79,45 @@ shasum -a 256 -c SHA256SUMS.txt   # macOS
 
 On Windows PowerShell, use `Get-FileHash .\\llm-proxy-windows-x86_64.exe -Algorithm SHA256` and compare the result with `SHA256SUMS.txt`.
 
-### 2. Configuration Reference (`~/.config/llm-proxy/config.toml`)
+## CLI & Service Management Commands
+
+```bash
+llm-proxy [OPTIONS] <COMMAND>
+
+Commands:
+  run                Run proxy in foreground (reads ~/.config/llm-proxy/config.toml)
+  setup              Interactive CLI wizard to configure providers and settings
+  install            Install as macOS launchd service
+  start              Start the background service
+  stop               Stop the background service
+  restart            Restart the background service
+  status             Show background service status
+  logs               Follow service stdout/stderr logs
+  providers list     List all configured providers and models
+  usage              Show accumulated usage and cost statistics
+  migrate-keychain   Migrate legacy flat keychain accounts to namespaced format
+  uninstall          Uninstall background service
+```
+
+### Usage CLI Options
+```bash
+llm-proxy usage                           # Show summary across all groups
+llm-proxy usage --by-provider             # Detailed provider and model breakdown
+llm-proxy usage --provider google_test    # Filter by specific provider
+llm-proxy usage --reset                   # Reset usage store
+```
+
+
+---
+
+## Configuration Reference (`~/.config/llm-proxy/config.toml`)
 
 #### Global Settings
 
 | Field | Default | Description |
 |---|---|---|
 | `listen_port` | `3128` | Local port the proxy server listens on. |
-| `default_provider` | `"bmw"` | Default provider ID used when requests omit a provider prefix. |
+| `default_provider` | `"openai"` | Default provider ID used when requests omit a provider prefix. |
 | `model_separator` | `"/"` | Separator character used between provider ID and model ID (e.g. `/` or `:`). |
 | `discovery_ttl_secs` | `300` | Discovery model cache time-to-live in seconds (5 min). |
 | `discovery_timeout_ms` | `2500` | Timeout per provider model discovery request in milliseconds. |
@@ -99,8 +130,8 @@ On Windows PowerShell, use `Get-FileHash .\\llm-proxy-windows-x86_64.exe -Algori
 
 | Field | Type | Description |
 |---|---|---|
-| `id` | `String` (Required) | Unique identifier for the provider (e.g. `"aws-bedrock"`, `"google_test"`, `"bmw_llm_api"`). |
-| `base_url` | `String` (Required) | Upstream hostname and path prefix (e.g. `"api.int.gcp.cloud.bmw/llmapi"`). |
+| `id` | `String` (Required) | Unique identifier for the provider (e.g. `"openai"`, `"aws-bedrock"`, `"google"`). |
+| `base_url` | `String` (Required) | Upstream hostname and path prefix (e.g. `"api.openai.com/v1"`). |
 | `scheme` | `String` | `"https"` (default) or `"http"`. |
 | `dialect` | `String` | `"openai_compatible"` (default) or `"bedrock_converse"`. |
 | `auth_style` | `String` | `"oauth_m2m"`, `"bearer_api_key"`, `"static_bearer"`, `"custom_header"`, `"aws_sigv4"`, or `"none"`. |
@@ -141,10 +172,10 @@ hidden = false                     # Set true to hide from /v1/models listing
 
 ```toml
 listen_port = 14142
-default_provider = "bmw_llm_api"
+default_provider = "enterprise-api"
 model_separator = "/"
 usage_store_path = "~/.config/llm-proxy/usage.json"
-ca_cert_path = "~/.config/llm-proxy/BMW_Trusted_Certificates_Latest.pem"
+ca_cert_path = "~/.config/llm-proxy/Enterprise_Trusted_Certificates_Latest.pem"
 
 # -------------------------------------------------------------
 # 1. AWS Bedrock Provider (SigV4 Authentication)
@@ -178,14 +209,14 @@ models = []
 # 3. Enterprise LLM API (OAuth M2M)
 # -------------------------------------------------------------
 [[providers]]
-id = "bmw_llm_api"
-base_url = "api.int.gcp.cloud.bmw/llmapi"
+id = "enterprise-api"
+base_url = "llm-api.corp.example.com/llmapi"
 scheme = "https"
 auth_style = "oauth_m2m"
-m2m_oauth_url = "https://auth.int.gcp.cloud.bmw/oauth/token"
+m2m_oauth_url = "https://auth.corp.example.com/oauth/token"
 client_id = "your-client-id"
-client_secret_ref = "keychain:bmw_llm_api:client_secret"
-api_key_ref = "keychain:bmw_llm_api:api_key"
+client_secret_ref = "keychain:enterprise-api:client_secret"
+api_key_ref = "keychain:enterprise-api:api_key"
 insecure_skip_tls_verify = true
 models = []
 ```
@@ -203,9 +234,9 @@ Save credentials using `keychain:<provider_id>:<secret_type>` identifiers:
 # Google Gemini API Key
 security add-generic-password -s "llm-proxy" -a "google_test:api_key" -w "YOUR_GEMINI_API_KEY"
 
-# BMW LLM API Credentials
-security add-generic-password -s "llm-proxy" -a "bmw_llm_api:client_secret" -w "YOUR_CLIENT_SECRET"
-security add-generic-password -s "llm-proxy" -a "bmw_llm_api:api_key" -w "YOUR_BMW_GATEWAY_KEY"
+# Enterprise LLM API Credentials
+security add-generic-password -s "llm-proxy" -a "enterprise-api:client_secret" -w "YOUR_CLIENT_SECRET"
+security add-generic-password -s "llm-proxy" -a "enterprise-api:api_key" -w "YOUR_Enterprise_GATEWAY_KEY"
 
 # AWS Static Credentials (if not using AWS SSO)
 security add-generic-password -s "llm-proxy" -a "aws-bedrock:aws_access_key_id" -w "AKIAIOSFODNN7EXAMPLE"
@@ -257,34 +288,6 @@ When a client sends a request with `"model": "<name>"`, `llm-proxy` resolves the
 5. **Fallback to Default Provider**: Routes to `default_provider`.
 
 ---
-
-## CLI & Service Management Commands
-
-```bash
-llm-proxy [OPTIONS] <COMMAND>
-
-Commands:
-  run                Run proxy in foreground (reads ~/.config/llm-proxy/config.toml)
-  setup              Interactive CLI wizard to configure providers and settings
-  install            Install as macOS launchd service
-  start              Start the background service
-  stop               Stop the background service
-  restart            Restart the background service
-  status             Show background service status
-  logs               Follow service stdout/stderr logs
-  providers list     List all configured providers and models
-  usage              Show accumulated usage and cost statistics
-  migrate-keychain   Migrate legacy flat keychain accounts to namespaced format
-  uninstall          Uninstall background service
-```
-
-### Usage CLI Options
-```bash
-llm-proxy usage                           # Show summary across all groups
-llm-proxy usage --by-provider             # Detailed provider and model breakdown
-llm-proxy usage --provider google_test    # Filter by specific provider
-llm-proxy usage --reset                   # Reset usage store
-```
 
 ---
 
