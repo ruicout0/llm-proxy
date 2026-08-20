@@ -1,1 +1,0 @@
-hyper_util::client::legacy::Client<HttpsConnector<ProxyConnector>, BoxBody<bytes::Bytes, hyper::Error>>
