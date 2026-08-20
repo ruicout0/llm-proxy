@@ -1,0 +1,29 @@
+# Rust build output
+/target/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# macOS
+.DS_Store
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local runtime/config data
+*.log
+usage.json
+prices_cache.json
+
+# Release/build artifacts
+/release/
+/artifacts/
+*.tar.gz
+*.zip
+*.p12
+*.pfx
