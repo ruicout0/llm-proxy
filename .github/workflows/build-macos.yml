@@ -1,0 +1,121 @@
+name: Build macOS Binary (legacy)
+
+# Release builds are handled by build-release.yml. Keep this workflow available
+# for manually requested macOS-only builds.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET_CPU: apple-m1
+
+jobs:
+  build:
+    name: Build macOS
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        rust: [stable]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary (aarch64 / Apple Silicon)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Code Sign Binaries
+        if: env.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          set -euo pipefail
+
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 12)
+          cleanup() {
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+            rm -f "$CERT_PATH"
+          }
+          trap cleanup EXIT
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          printf '%s' "$MACOS_CERTIFICATE" | tr -d '[:space:]' | base64 -D > "$CERT_PATH"
+          # Validate the PKCS#12 password before importing so a bad secret fails clearly.
+          openssl pkcs12 -in "$CERT_PATH" -passin env:MACOS_CERTIFICATE_PWD -noout
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          # Sign the Apple Silicon binary with the configured Developer ID identity.
+          codesign --keychain "$KEYCHAIN_PATH" -s "com.ruicouto.codesign" -i com.ruicouto.llm-proxy -f target/aarch64-apple-darwin/release/llm-proxy
+
+      - name: Test binary runs (aarch64)
+        run: ./target/aarch64-apple-darwin/release/llm-proxy --help
+
+      - name: Upload aarch64 binary as artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: llm-proxy-macos-aarch64
+          path: target/aarch64-apple-darwin/release/llm-proxy
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          mv artifacts/llm-proxy-macos-aarch64 release/llm-proxy-macos-aarch64
+          chmod +x release/*
+
+      - name: Generate checksums
+        run: |
+          cd release
+          shasum -a 256 * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            release/llm-proxy-macos-aarch64
+            release/SHA256SUMS.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
