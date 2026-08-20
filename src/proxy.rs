@@ -10,8 +10,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::dialect::{
-    normalize_upstream_error_response, resolve_bedrock_inference_profile_id,
-    sanitize_openai_request, sanitize_openai_response, sanitize_sse_chunk,
+    resolve_bedrock_inference_profile_id, sanitize_openai_request, sanitize_sse_chunk,
     transform_bedrock_to_openai, transform_openai_to_bedrock, Dialect, EventStreamDecoder,
 };
 use crate::discovery::DiscoveryCache;
@@ -159,7 +158,7 @@ pub async fn handle_request(
     }
 
     // 3. Buffer request body
-    let (parts, mut body_bytes) = {
+    let (parts, body_bytes) = {
         let (parts, body) = req.into_parts();
         let bytes = to_bytes(body).await?;
         (parts, bytes)
@@ -213,7 +212,10 @@ pub async fn handle_request(
         method, path_and_query, raw_request_model
     );
     if let Some(ref json_val) = parsed_body {
-        info!("Request payload: {}", serde_json::to_string(json_val).unwrap_or_default());
+        info!(
+            "Request payload: {}",
+            serde_json::to_string(json_val).unwrap_or_default()
+        );
     }
 
     // 4. Resolve Route
@@ -668,7 +670,10 @@ pub async fn record_usage_from_response(
                             continue;
                         } else {
                             let clean_chunk = sanitize_sse_chunk(&chunk, &state.canonical_model);
-                            return Some((Ok::<Bytes, hyper::Error>(Bytes::from(clean_chunk)), state));
+                            return Some((
+                                Ok::<Bytes, hyper::Error>(Bytes::from(clean_chunk)),
+                                state,
+                            ));
                         }
                     }
                     Some(Err(e)) => return Some((Err(e), state)),

@@ -337,7 +337,6 @@ impl EventStreamDecoder {
     }
 }
 
-
 /// Sanitizes OpenAI-compatible chat completion requests before forwarding to providers.
 /// For Google Gemini:
 /// 1. Strips unsupported top-level fields (e.g. `reasoning_effort`, `strict`).
@@ -408,7 +407,9 @@ pub fn sanitize_openai_request(val: &mut serde_json::Value, base_url: &str) {
             // Fix thought_signature requirement for Gemini tool calls in conversation history
             if let Some(messages) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
                 for msg in messages {
-                    if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+                    if let Some(tool_calls) =
+                        msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
+                    {
                         for tc in tool_calls {
                             if let Some(tc_obj) = tc.as_object_mut() {
                                 let has_sig = tc_obj
@@ -447,26 +448,31 @@ pub fn sanitize_sse_chunk(chunk: &[u8], canonical_model: &str) -> Vec<u8> {
         let mut any_changed = false;
         for line in lines {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("data:") {
-                let data = trimmed[5..].trim();
+            if let Some(data) = trimmed.strip_prefix("data:").map(str::trim) {
                 if !data.is_empty() && data != "[DONE]" {
                     if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(data) {
                         let mut changed = false;
                         if !canonical_model.is_empty() {
                             if let Some(m) = val.get("model").and_then(|v| v.as_str()) {
                                 if m != canonical_model {
-                                    val["model"] = serde_json::Value::String(canonical_model.to_string());
+                                    val["model"] =
+                                        serde_json::Value::String(canonical_model.to_string());
                                     changed = true;
                                 }
                             }
                         }
-                        if let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut()) {
+                        if let Some(choices) = val.get_mut("choices").and_then(|c| c.as_array_mut())
+                        {
                             for choice in choices {
-                                if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
+                                if let Some(delta) =
+                                    choice.get_mut("delta").and_then(|d| d.as_object_mut())
+                                {
                                     if delta.remove("extra_content").is_some() {
                                         changed = true;
                                     }
-                                    if let Some(tool_calls) = delta.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+                                    if let Some(tool_calls) =
+                                        delta.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
+                                    {
                                         for tc in tool_calls {
                                             if let Some(tc_obj) = tc.as_object_mut() {
                                                 if tc_obj.remove("extra_content").is_some() {
@@ -476,11 +482,15 @@ pub fn sanitize_sse_chunk(chunk: &[u8], canonical_model: &str) -> Vec<u8> {
                                         }
                                     }
                                 }
-                                if let Some(msg) = choice.get_mut("message").and_then(|m| m.as_object_mut()) {
+                                if let Some(msg) =
+                                    choice.get_mut("message").and_then(|m| m.as_object_mut())
+                                {
                                     if msg.remove("extra_content").is_some() {
                                         changed = true;
                                     }
-                                    if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+                                    if let Some(tool_calls) =
+                                        msg.get_mut("tool_calls").and_then(|tc| tc.as_array_mut())
+                                    {
                                         for tc in tool_calls {
                                             if let Some(tc_obj) = tc.as_object_mut() {
                                                 if tc_obj.remove("extra_content").is_some() {
@@ -505,8 +515,12 @@ pub fn sanitize_sse_chunk(chunk: &[u8], canonical_model: &str) -> Vec<u8> {
             out_lines.push(line.to_string());
         }
         if any_changed {
-            return out_lines.join("
-").into_bytes();
+            return out_lines
+                .join(
+                    "
+",
+                )
+                .into_bytes();
         }
     }
     chunk.to_vec()
@@ -521,7 +535,10 @@ pub fn sanitize_openai_response(val: &mut serde_json::Value) -> bool {
                 if message.remove("extra_content").is_some() {
                     modified = true;
                 }
-                if let Some(tool_calls) = message.get_mut("tool_calls").and_then(|tc| tc.as_array_mut()) {
+                if let Some(tool_calls) = message
+                    .get_mut("tool_calls")
+                    .and_then(|tc| tc.as_array_mut())
+                {
                     for tc in tool_calls {
                         if let Some(tc_obj) = tc.as_object_mut() {
                             if tc_obj.remove("extra_content").is_some() {
@@ -536,18 +553,26 @@ pub fn sanitize_openai_response(val: &mut serde_json::Value) -> bool {
     modified
 }
 
-
 /// Normalizes upstream error payloads to standard OpenAI format `{"error": {"message": "...", "type": "...", "code": ...}}`.
 /// Google Gemini sometimes returns non-standard JSON arrays like `[{"error": {"code": 503, "message": "..."}}]`
 /// or malformed bodies which cause Copilot's CAPI parser to throw CAPIError: 400.
-pub fn normalize_upstream_error_response(body_bytes: &[u8], status: hyper::StatusCode) -> Option<Vec<u8>> {
+pub fn normalize_upstream_error_response(
+    body_bytes: &[u8],
+    status: hyper::StatusCode,
+) -> Option<Vec<u8>> {
     if let Ok(val) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
         // If it's an array with an error object inside: `[{"error": ...}]`
         if let Some(arr) = val.as_array() {
             if let Some(first) = arr.first() {
                 if let Some(err_obj) = first.get("error") {
-                    let msg = err_obj.get("message").and_then(|m| m.as_str()).unwrap_or("Upstream error");
-                    let code = err_obj.get("code").and_then(|c| c.as_u64()).unwrap_or(status.as_u16() as u64);
+                    let msg = err_obj
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("Upstream error");
+                    let code = err_obj
+                        .get("code")
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(status.as_u16() as u64);
                     let norm = serde_json::json!({
                         "error": {
                             "message": msg,
@@ -686,7 +711,9 @@ mod tests {
         // Verify thought_signature was injected on the tool call
         let tc = &req["messages"][1]["tool_calls"][0];
         assert_eq!(
-            tc["extra_content"]["google"]["thought_signature"].as_str().unwrap(),
+            tc["extra_content"]["google"]["thought_signature"]
+                .as_str()
+                .unwrap(),
             "skip_thought_signature_validator"
         );
     }
