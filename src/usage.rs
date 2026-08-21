@@ -378,5 +378,140 @@ pub fn usage_dashboard_html() -> &'static str {
     .empty { color: var(--muted); font-style: italic; padding: 20px; text-align: center; }
     .right { text-align: right; }
     .last-updated { color: var(--muted); font-size: 0.8rem; margin-top: 12px; }
-    @media (max-width: 600px) {\n      .container { padding: 20px 14px; }\n      th, td { padding: 10px 12px; font-size: 0.85rem; }\n    }\n  </style>\n</head>\n<body>\n  <div class=\"container\">\n    <header>\n      <h1>🧠 LLM Proxy Usage</h1>\n      <div class=\"subtitle\">Live cost and token totals from proxied requests</div>\n      <div class=\"refresh\">Auto-refresh every 30s · <a href=\"/llm-proxy/usage\" style=\"color:var(--accent)\">JSON API</a></div>\n    </header>\n\n    <div class=\"grid\" id=\"summary\">\n      <div class=\"card\"><h3>Total Requests</h3><div class=\"value accent\" id=\"total-requests\">–</div></div>\n      <div class=\"card\"><h3>Total Cost</h3><div class=\"value success\" id=\"total-cost\">–</div></div>\n      <div class=\"card\"><h3>Active Groups</h3><div class=\"value\" id=\"active-groups\">–</div></div>\n      <div class=\"card\"><h3>Models Used</h3><div class=\"value\" id=\"models-used\">–</div></div>\n    </div>\n\n    <section>\n      <h2>📊 Per-Group / Per-Model</h2>\n      <table id=\"details-table\">\n        <thead>\n          <tr><th>Group</th><th>Model</th><th class=\"right\">Requests</th><th class=\"right\">Cost</th><th class=\"right\">Tokens</th></tr>\n        </thead>\n        <tbody id=\"details-body\"><tr><td colspan=\"5\" class=\"empty\">No usage recorded yet.</td></tr></tbody>\n      </table>\n      <div class=\"last-updated\" id=\"last-updated\"></div>\n    </section>\n  </div>\n\n  <script>\n    const fmt = (n) => typeof n === 'number' ? n.toLocaleString() : '–';\n    const fmtCost = (n, c) => typeof n === 'number' ? `${n.toFixed(6)} ${c || 'USD'}` : '–';\n\n    async function load() {\n      try {\n        const res = await fetch('/llm-proxy/usage');\n        const data = await res.json();\n\n        document.getElementById('total-requests').textContent = fmt(data.global_requests);\n\n        const costEntries = Object.entries(data.global_totals || {}).filter(([k]) => !k.endsWith('_tokens'));\n        document.getElementById('total-cost').textContent = costEntries.length\n          ? costEntries.map(([c, a]) => fmtCost(a, c)).join(' + ')\n          : '$0.000000';\n\n        const groups = Object.entries(data.groups || {});\n        document.getElementById('active-groups').textContent = groups.length;\n\n        let modelCount = 0;\n        const tbody = document.getElementById('details-body');\n        tbody.innerHTML = '';\n\n        if (groups.length === 0) {\n          tbody.innerHTML = '<tr><td colspan=\"5\" class=\"empty\">No usage recorded yet.</td></tr>';\n        } else {\n          for (const [groupName, group] of groups) {\n            const models = Object.entries(group.models || {});\n            modelCount += models.length;\n            for (const [modelName, model] of models) {\n              const cost = Object.entries(model.cost || {})\n                .filter(([k]) => !k.endsWith('_tokens'))\n                .map(([c, a]) => fmtCost(a, c))\n                .join(' + ') || '–';\n              const tokens = Object.entries(model.tokens || {})\n                .map(([t, n]) => `${t}: ${fmt(n)}`)\n                .join('<br>') || '–';\n              const row = document.createElement('tr');\n              row.innerHTML = `<td><span class=\"tag\">${groupName}</span></td><td>${modelName}</td><td class=\"right\">${fmt(model.requests)}</td><td class=\"right\">${cost}</td><td class=\"right\">${tokens}</td>`;\n              tbody.appendChild(row);\n            }\n          }\n        }\n        document.getElementById('models-used').textContent = modelCount;\n\n        const ts = data.last_updated\n          ? new Date(data.last_updated * 1000).toLocaleString()\n          : 'never';\n        document.getElementById('last-updated').textContent = 'Last updated: ' + ts;\n      } catch (e) {\n        console.error(e);\n      }\n    }\n\n    load();\n    setInterval(load, 30000);\n  </script>\n</body>\n</html>"##
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 0 0 14px; }
+    .toolbar input, .toolbar select, .toolbar button {
+      border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+      color: var(--text); font: inherit; font-size: 0.85rem; padding: 9px 12px; outline: none;
+    }
+    .toolbar input { flex: 1 1 220px; min-width: 180px; }
+    .toolbar input:focus, .toolbar select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(56,189,248,.15); }
+    .toolbar button { cursor: pointer; color: var(--accent); }
+    .toolbar button:hover { background: var(--panel-2); }
+    .result-count { color: var(--muted); font-size: 0.82rem; margin-left: auto; }
+    .table-wrap { overflow-x: auto; border-radius: var(--radius); }
+    .model { font-weight: 600; color: var(--text); }
+    .provider { color: var(--muted); font-size: 0.78rem; margin-top: 2px; }
+    .cost-estimated { color: #fbbf24; }
+    @media (max-width: 600px) {
+      .container { padding: 20px 14px; }
+      th, td { padding: 10px 12px; font-size: 0.85rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🧠 LLM Proxy Usage</h1>
+      <div class="subtitle">Live cost and token totals from proxied requests</div>
+      <div class="refresh">Auto-refresh every 30s · <a href="/llm-proxy/usage" style="color:var(--accent)">JSON API</a></div>
+    </header>
+
+    <div class="grid" id="summary">
+      <div class="card"><h3>Total Requests</h3><div class="value accent" id="total-requests">–</div></div>
+      <div class="card"><h3>Total Cost</h3><div class="value success" id="total-cost">–</div></div>
+      <div class="card"><h3>Active Groups</h3><div class="value" id="active-groups">–</div></div>
+      <div class="card"><h3>Models Used</h3><div class="value" id="models-used">–</div></div>
+    </div>
+
+    <section>
+      <h2>📊 Per-Group / Per-Model</h2>
+      <div class="toolbar" aria-label="Usage filters">
+        <input id="search" type="search" placeholder="Search groups or models…" aria-label="Search groups or models">
+        <select id="group-filter" aria-label="Filter by group"><option value="">All groups</option></select>
+        <select id="sort" aria-label="Sort results">
+          <option value="requests">Sort: requests</option>
+          <option value="cost">Sort: cost</option>
+          <option value="tokens">Sort: tokens</option>
+          <option value="name">Sort: name</option>
+        </select>
+        <button id="clear-filters" type="button">Clear</button>
+        <span class="result-count" id="result-count"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="details-table">
+          <thead>
+            <tr><th>Group</th><th>Model</th><th class="right">Requests</th><th class="right">Cost</th><th class="right">Tokens</th></tr>
+          </thead>
+          <tbody id="details-body"><tr><td colspan="5" class="empty">No usage recorded yet.</td></tr></tbody>
+        </table>
+      </div>
+      <div class="last-updated" id="last-updated"></div>
+    </section>
+  </div>
+
+  <script>
+    const fmt = (n) => typeof n === 'number' ? n.toLocaleString() : '–';
+    const fmtCost = (n, c) => typeof n === 'number' ? `${n.toFixed(6)} ${c || 'USD'}` : '–';
+
+    let allRows = [];
+    const search = document.getElementById('search');
+    const groupFilter = document.getElementById('group-filter');
+    const sort = document.getElementById('sort');
+
+    function renderRows() {
+      const query = search.value.trim().toLowerCase();
+      const selectedGroup = groupFilter.value;
+      const key = sort.value;
+      const rows = allRows.filter(row =>
+        (!selectedGroup || row.group === selectedGroup) &&
+        (!query || `${row.group} ${row.model}`.toLowerCase().includes(query))
+      ).sort((a, b) => key === 'name'
+        ? `${a.group}${a.model}`.localeCompare(`${b.group}${b.model}`)
+        : (b[key] || 0) - (a[key] || 0));
+      const tbody = document.getElementById('details-body');
+      tbody.innerHTML = rows.length ? rows.map(row => `<tr><td><span class="tag">${row.group}</span></td><td><div class="model">${row.model}</div></td><td class="right">${fmt(row.requests)}</td><td class="right">${row.costText}</td><td class="right">${row.tokensText}</td></tr>`).join('') : '<tr><td colspan="5" class="empty">No matching usage.</td></tr>';
+      document.getElementById('result-count').textContent = `${rows.length} of ${allRows.length} rows`;
+    }
+
+    [search, groupFilter, sort].forEach(control => control.addEventListener('input', renderRows));
+    document.getElementById('clear-filters').addEventListener('click', () => { search.value = ''; groupFilter.value = ''; sort.value = 'requests'; renderRows(); });
+
+    async function load() {
+      try {
+        const res = await fetch('/llm-proxy/usage');
+        const data = await res.json();
+
+        document.getElementById('total-requests').textContent = fmt(data.global_requests);
+
+        const costEntries = Object.entries(data.global_totals || {}).filter(([k]) => !k.endsWith('_tokens'));
+        document.getElementById('total-cost').textContent = costEntries.length
+          ? costEntries.map(([c, a]) => fmtCost(a, c)).join(' + ')
+          : '$0.000000';
+
+        const groups = Object.entries(data.groups || {})
+          .filter(([groupName]) => groupName !== '__probe');
+        document.getElementById('active-groups').textContent = groups.length;
+
+        allRows = [];
+        const groupNames = [];
+        for (const [groupName, group] of groups) {
+          groupNames.push(groupName);
+          for (const [modelName, model] of Object.entries(group.models || {})) {
+            const costEntries = Object.entries(model.cost || {}).filter(([k]) => !k.endsWith('_tokens'));
+            const costValue = costEntries.reduce((sum, [, amount]) => sum + (typeof amount === 'number' ? amount : 0), 0);
+            const costText = costEntries.map(([c, a]) => fmtCost(a, c)).join(' + ') || '–';
+            const tokens = Object.entries(model.tokens || {});
+            const tokenValue = tokens.reduce((sum, [, amount]) => sum + (typeof amount === 'number' ? amount : 0), 0);
+            allRows.push({ group: groupName, model: modelName, requests: model.requests || 0, cost: costValue, tokens: tokenValue, costText, tokensText: tokens.map(([t, n]) => `${t}: ${fmt(n)}`).join('<br>') || '–' });
+          }
+        }
+        groupFilter.innerHTML = '<option value="">All groups</option>' + groupNames.map(name => `<option value="${name}">${name}</option>`).join('');
+        document.getElementById('models-used').textContent = allRows.length;
+        renderRows();
+
+        const ts = data.last_updated
+          ? new Date(data.last_updated * 1000).toLocaleString()
+          : 'never';
+        document.getElementById('last-updated').textContent = 'Last updated: ' + ts;
+      } catch (e) {
+        document.getElementById('last-updated').textContent = 'Unable to load usage data';
+        console.error(e);
+      }
+    }
+
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>"##
 }
