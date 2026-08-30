@@ -62,6 +62,7 @@ pub enum AuthStyleConfig {
     StaticBearer,
     CustomHeader,
     AwsSigv4,
+    GithubCopilot,
     None,
 }
 
@@ -124,6 +125,16 @@ pub struct ProviderConfig {
     pub aws_session_token_ref: Option<String>,
     #[serde(default)]
     pub aws_profile: Option<String>,
+
+    // GitHub Copilot specific configuration (supports github.com and GitHub Enterprise Cloud XXX.ghe.com)
+    #[serde(default)]
+    pub github_token: Option<String>,
+    #[serde(default)]
+    pub github_token_ref: Option<String>,
+    #[serde(default)]
+    pub github_token_url: Option<String>,
+    #[serde(default)]
+    pub enterprise_domain: Option<String>,
 
     #[serde(default)]
     pub ca_cert_path: Option<String>,
@@ -239,6 +250,10 @@ impl ConfigFile {
                 aws_session_token: None,
                 aws_session_token_ref: None,
                 aws_profile: None,
+                github_token: None,
+                github_token_ref: None,
+                github_token_url: None,
+                enterprise_domain: None,
                 ca_cert_path: self.ca_cert_path.clone(),
                 insecure_skip_tls_verify: self.insecure_skip_tls_verify,
                 models: Vec::new(),

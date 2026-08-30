@@ -427,6 +427,22 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
                 req_builder = req_builder.header(AUTHORIZATION, format!("Bearer {}", auth_token));
             }
         }
+        crate::provider::AuthStyle::GithubCopilot { .. } => {
+            let bearer = prov
+                .token_cache
+                .get_valid_bearer()
+                .await
+                .ok()
+                .unwrap_or_default();
+            if !bearer.is_empty() {
+                req_builder = req_builder.header(AUTHORIZATION, format!("Bearer {}", bearer));
+            }
+            req_builder = req_builder
+                .header("editor-version", "vscode/1.96.0")
+                .header("editor-plugin-version", "copilot-chat/0.22.0")
+                .header("copilot-integration-id", "vscode-chat")
+                .header("openai-organization", "github-copilot");
+        }
         crate::provider::AuthStyle::CustomHeader { name, .. } => {
             let val = prov.token_cache.get_x_api_key().await.unwrap_or_default();
             if !val.is_empty() {
@@ -457,7 +473,7 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
         Err(e) => {
             tracing::warn!("Failed client.request for '{}': {}", prov.id, e);
             return Err(e.into());
-        }
+        };
     };
 
     if !resp.status().is_success() {
