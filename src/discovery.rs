@@ -473,7 +473,7 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
         Err(e) => {
             tracing::warn!("Failed client.request for '{}': {}", prov.id, e);
             return Err(e.into());
-        };
+        }
     };
 
     if !resp.status().is_success() {

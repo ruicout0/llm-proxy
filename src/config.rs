@@ -8,7 +8,7 @@ fn default_port() -> u16 {
 }
 
 fn default_provider_id() -> String {
-    "bmw".to_string()
+    "default".to_string()
 }
 
 fn default_model_separator() -> char {
