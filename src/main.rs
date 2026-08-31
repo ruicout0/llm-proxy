@@ -175,7 +175,7 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         std::fs::create_dir_all(config_dir)?;
     }
 
-    let default_prov_id = "bmw".to_string();
+    let default_prov_id = "default".to_string();
 
     if args.use_keychain {
         if let Some(ref key) = args.api_key {
@@ -258,6 +258,10 @@ async fn install_service(args: InstallArgs, config_file: Option<PathBuf>) -> Res
         aws_session_token: None,
         aws_session_token_ref: None,
         aws_profile: None,
+        github_token: None,
+        github_token_ref: None,
+        github_token_url: None,
+        enterprise_domain: None,
         ca_cert_path: None,
         insecure_skip_tls_verify: false,
         models: Vec::new(),
@@ -365,7 +369,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                 insecure_skip_tls_verify: false,
                 usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
                 pricing_cache_path: None,
-                default_provider: "bmw".to_string(),
+                default_provider: "default".to_string(),
                 model_separator: '/',
                 discovery_ttl_secs: 300,
                 discovery_timeout_ms: 2500,
@@ -386,7 +390,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
             insecure_skip_tls_verify: false,
             usage_store_path: Some(default_usage_store_path().to_string_lossy().to_string()),
             pricing_cache_path: None,
-            default_provider: "bmw".to_string(),
+            default_provider: "default".to_string(),
             model_separator: '/',
             discovery_ttl_secs: 300,
             discovery_timeout_ms: 2500,
@@ -412,7 +416,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
         match action {
             0 => {
                 let id: String = Input::new()
-                    .with_prompt("Provider ID (e.g., bmw, openai, anthropic, bedrock, ollama)")
+                    .with_prompt("Provider ID (e.g., default, openai, anthropic, bedrock, ollama)")
                     .interact_text()?;
 
                 let auth_choice = Select::new()
@@ -420,7 +424,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                     .items(&[
                         "Bearer API Key (e.g. OpenAI / Standard)",
                         "AWS SigV4 (Amazon Bedrock)",
-                        "OAuth M2M Client Credentials (e.g. BMW Gateway)",
+                        "OAuth M2M Client Credentials (e.g. Enterprise Gateway)",
                         "Static Bearer Token",
                         "Custom Header (e.g. x-api-key)",
                         "None / Local (e.g. Ollama)",
@@ -432,7 +436,7 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                     String::new()
                 } else {
                     Input::new()
-                        .with_prompt("Base URL / Host (e.g. api.openai.com, api.internal.bmw.com, 127.0.0.1:11434/v1)")
+                        .with_prompt("Base URL / Host (e.g. api.openai.com, api.internal.example.com, 127.0.0.1:11434/v1)")
                         .interact_text()?
                 };
 
@@ -482,6 +486,10 @@ async fn setup_config(config_path: Option<PathBuf>) -> Result<()> {
                     aws_session_token: None,
                     aws_session_token_ref: None,
                     aws_profile: None,
+                    github_token: None,
+                    github_token_ref: None,
+                    github_token_url: None,
+                    enterprise_domain: None,
                     ca_cert_path: None,
                     insecure_skip_tls_verify: false,
                     models: Vec::new(),
@@ -783,9 +791,9 @@ async fn usage_command(args: UsageArgs, config_file: Option<PathBuf>) -> Result<
 
 fn migrate_keychain(args: MigrateKeychainArgs) -> Result<()> {
     let legacy_keys = [
-        ("x-api-key", "bmw:api_key"),
-        ("bearer-token", "bmw:bearer_token"),
-        ("client-secret", "bmw:client_secret"),
+        ("x-api-key", "default:api_key"),
+        ("bearer-token", "default:bearer_token"),
+        ("client-secret", "default:client_secret"),
     ];
 
     println!("Keychain Migration:");
@@ -1139,6 +1147,10 @@ bearer_token = "token"
                 aws_session_token: None,
                 aws_session_token_ref: None,
                 aws_profile: None,
+                github_token: None,
+                github_token_ref: None,
+                github_token_url: None,
+                enterprise_domain: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 models: Vec::new(),
@@ -1179,6 +1191,10 @@ bearer_token = "token"
                 aws_session_token: None,
                 aws_session_token_ref: None,
                 aws_profile: None,
+                github_token: None,
+                github_token_ref: None,
+                github_token_url: None,
+                enterprise_domain: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 models: Vec::new(),
@@ -1221,6 +1237,10 @@ bearer_token = "token"
                 aws_session_token: None,
                 aws_session_token_ref: None,
                 aws_profile: None,
+                github_token: None,
+                github_token_ref: None,
+                github_token_url: None,
+                enterprise_domain: None,
                 ca_cert_path: None,
                 insecure_skip_tls_verify: false,
                 models: Vec::new(),
@@ -1500,14 +1520,14 @@ usage_store_path = "/custom/usage.json"
     #[tokio::test]
     async fn routing_precedence_all_cases() {
         let toml_str = r#"
-default_provider = "bmw"
+default_provider = "default"
 model_separator = "/"
 
 [[providers]]
-id = "bmw"
-base_url = "api.bmw.com"
+id = "default"
+base_url = "api.example.com"
 auth_style = "bearer_api_key"
-api_key = "bmw-key"
+api_key = "default-key"
 
   [[providers.models]]
   id = "gpt-4o"
@@ -1546,8 +1566,8 @@ api_key = "openai-key"
 
         // 2. Alias
         let r2 = registry.resolve_route(Some("fast"), None).await.unwrap();
-        assert_eq!(r2.provider.id, "bmw");
-        assert_eq!(r2.canonical_model, "bmw/gpt-4o");
+        assert_eq!(r2.provider.id, "default");
+        assert_eq!(r2.canonical_model, "default/gpt-4o");
 
         // 3. x-llm-provider header
         let r3 = registry
@@ -1562,7 +1582,7 @@ api_key = "openai-key"
         assert_eq!(r4.provider.id, "openai");
         assert_eq!(r4.canonical_model, "openai/o3-mini");
 
-        // 4b. Ambiguous bare name without provider (gpt-4o is in both bmw and openai)
+        // 4b. Ambiguous bare name without provider (gpt-4o is in both default and openai)
         let r_amb = registry.resolve_route(Some("gpt-4o"), None).await;
         assert!(r_amb.is_err());
         assert!(r_amb
@@ -1575,9 +1595,9 @@ api_key = "openai-key"
             .resolve_route(Some("unlisted-model"), None)
             .await
             .unwrap();
-        assert_eq!(r5.provider.id, "bmw");
+        assert_eq!(r5.provider.id, "default");
         assert_eq!(r5.upstream_model, "unlisted-model");
-        assert_eq!(r5.canonical_model, "bmw/unlisted-model");
+        assert_eq!(r5.canonical_model, "default/unlisted-model");
     }
 
     #[tokio::test]
@@ -1669,6 +1689,10 @@ api_key = "openai-key"
             aws_session_token: None,
             aws_session_token_ref: None,
             aws_profile: None,
+            github_token: None,
+            github_token_ref: None,
+            github_token_url: None,
+            enterprise_domain: None,
             ca_cert_path: None,
             insecure_skip_tls_verify: false,
             models: vec![ModelSpec {

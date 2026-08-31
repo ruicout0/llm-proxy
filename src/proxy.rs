@@ -409,6 +409,33 @@ pub async fn handle_request(
                         );
                     }
                 }
+                AuthStyle::GithubCopilot { .. } => {
+                    let bearer = provider.token_cache.get_valid_bearer().await?;
+                    if !bearer.is_empty() {
+                        req_builder = req_builder.header(
+                            AUTHORIZATION,
+                            HeaderValue::from_str(&format!("Bearer {}", bearer))?,
+                        );
+                    }
+                    req_builder = req_builder
+                        .header("editor-version", HeaderValue::from_static("vscode/1.96.0"))
+                        .header(
+                            "editor-plugin-version",
+                            HeaderValue::from_static("copilot-chat/0.22.0"),
+                        )
+                        .header(
+                            "copilot-integration-id",
+                            HeaderValue::from_static("vscode-chat"),
+                        )
+                        .header(
+                            "openai-organization",
+                            HeaderValue::from_static("github-copilot"),
+                        )
+                        .header(
+                            "openai-intent",
+                            HeaderValue::from_static("conversation-panel"),
+                        );
+                }
                 AuthStyle::AwsSigv4 { region, .. } => {
                     let creds = provider.token_cache.get_aws_credentials().await?;
                     let signer = SigV4Signer::new("bedrock", region, &creds);

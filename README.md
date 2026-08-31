@@ -332,3 +332,46 @@ When a client sends a request with `"model": "<name>"`, `llm-proxy` resolves the
 * **Provider Health Status**: `GET http://localhost:14142/llm-proxy/health`
 * **Usage JSON Store**: `GET http://localhost:14142/llm-proxy/usage`
 * **Web Cost Dashboard**: `GET http://localhost:14142/llm-proxy/usage/dashboard`
+
+---
+
+## GitHub Copilot Provider Integration
+
+`llm-proxy` supports routing requests through GitHub Copilot (both public `github.com` and **GitHub Enterprise Cloud** `XXX.ghe.com`).
+
+### How It Works
+1. `llm-proxy` takes the root GitHub OAuth token (`ghu_...` or PAT) from:
+   - Config reference (`github_token_ref = "keychain:copilot:token"` or `github_token`)
+   - Environment variables (`GITHUB_COPILOT_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`)
+   - Copilot CLI config files (`~/.config/github-copilot/hosts.json` / `apps.json`)
+   - macOS Keychain (`GitHub - https://XXX.ghe.com` or `vscode-github.login/gh-token`)
+2. `llm-proxy` dynamically exchanges the root token with the Copilot internal endpoint (`https://api.XXX.ghe.com/copilot_internal/v2/token` or `https://api.github.com/copilot_internal/v2/token`) to obtain a short-lived session token (`tid=...`).
+3. Session tokens are cached in memory and automatically refreshed before expiration (typically every 30 minutes).
+4. Outbound inference requests to Copilot API automatically have required Copilot editor and telemetry headers injected (`Editor-Version`, `Editor-Plugin-Version`, `Copilot-Integration-Id`, etc.).
+
+### Configuration Example: GitHub Enterprise Cloud (`XXX.ghe.com`)
+
+```toml
+[[providers]]
+id = "copilot"
+base_url = "api.individual.githubcopilot.com" # or "api.XXX.ghe.com"
+scheme = "https"
+dialect = "openai_compatible"
+auth_style = "github_copilot"
+
+# Enterprise domain configuration (automatically derives token endpoint):
+enterprise_domain = "XXX.ghe.com"
+
+# Or specify custom token exchange endpoint explicitly:
+# github_token_url = "https://api.XXX.ghe.com/copilot_internal/v2/token"
+
+# Token reference in keychain or inline:
+github_token_ref = "keychain:copilot:github_token"
+
+models = [
+  { id = "gpt-4o", alias = "copilot-4o" },
+  { id = "claude-3.5-sonnet", alias = "copilot-sonnet" },
+  { id = "o1-preview" },
+  { id = "o3-mini" },
+]
+```

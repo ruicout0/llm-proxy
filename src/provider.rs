@@ -111,6 +111,12 @@ pub enum AuthStyle {
         session_token: Option<String>,
         profile: Option<String>,
     },
+    GithubCopilot {
+        token_url: String,
+        token_ref: Option<String>,
+        github_token: Option<String>,
+        enterprise_domain: Option<String>,
+    },
     None,
 }
 
@@ -250,6 +256,33 @@ impl Provider {
                     profile: cfg.aws_profile.clone(),
                 }
             }
+            Some(AuthStyleConfig::GithubCopilot) => {
+                let token_url = if let Some(ref u) = cfg.github_token_url {
+                    u.clone()
+                } else if let Some(ref domain) = cfg.enterprise_domain {
+                    let clean = domain
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .trim_end_matches('/');
+                    format!("https://api.{}/copilot_internal/v2/token", clean)
+                } else if cfg.base_url.contains(".ghe.com") {
+                    let host = cfg.base_url.split('/').next().unwrap_or(&cfg.base_url);
+                    let clean = host
+                        .trim_start_matches("https://")
+                        .trim_start_matches("http://")
+                        .trim_end_matches('/');
+                    format!("https://api.{}/copilot_internal/v2/token", clean)
+                } else {
+                    "https://api.github.com/copilot_internal/v2/token".to_string()
+                };
+
+                AuthStyle::GithubCopilot {
+                    token_url,
+                    token_ref: cfg.github_token_ref.clone(),
+                    github_token: cfg.github_token.clone(),
+                    enterprise_domain: cfg.enterprise_domain.clone(),
+                }
+            }
             Some(AuthStyleConfig::None) => AuthStyle::None,
             None => {
                 if cfg.m2m_oauth_url.is_some() || cfg.client_id.is_some() {
@@ -275,6 +308,28 @@ impl Provider {
                     AuthStyle::BearerApiKey {
                         key_ref: cfg.api_key_ref.clone(),
                         api_key: cfg.api_key.clone(),
+                    }
+                } else if cfg.github_token.is_some()
+                    || cfg.github_token_ref.is_some()
+                    || cfg.enterprise_domain.is_some()
+                    || cfg.base_url.contains("githubcopilot")
+                {
+                    let token_url = if let Some(ref u) = cfg.github_token_url {
+                        u.clone()
+                    } else if let Some(ref domain) = cfg.enterprise_domain {
+                        let clean = domain
+                            .trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .trim_end_matches('/');
+                        format!("https://api.{}/copilot_internal/v2/token", clean)
+                    } else {
+                        "https://api.github.com/copilot_internal/v2/token".to_string()
+                    };
+                    AuthStyle::GithubCopilot {
+                        token_url,
+                        token_ref: cfg.github_token_ref.clone(),
+                        github_token: cfg.github_token.clone(),
+                        enterprise_domain: cfg.enterprise_domain.clone(),
                     }
                 } else {
                     AuthStyle::None
@@ -921,6 +976,26 @@ end try"#,
                 *w = Some((token.clone(), Instant::now() + Duration::from_secs(3500)));
                 Ok(token)
             }
+            AuthStyle::GithubCopilot { .. } => {
+                {
+                    let r = self.bearer_token.read().await;
+                    if let Some((tok, expiry)) = &*r {
+                        if Instant::now() < *expiry {
+                            return Ok(tok.clone());
+                        }
+                    }
+                }
+                let mut w = self.bearer_token.write().await;
+                if let Some((tok, expiry)) = &*w {
+                    if Instant::now() < *expiry {
+                        return Ok(tok.clone());
+                    }
+                }
+                let (token, expires_in) = self.refresh_copilot_token().await?;
+                let cache_duration = Duration::from_secs(expires_in.saturating_sub(60).max(60));
+                *w = Some((token.clone(), Instant::now() + cache_duration));
+                Ok(token)
+            }
             AuthStyle::BearerApiKey { key_ref, api_key } => {
                 {
                     let r = self.bearer_token.read().await;
@@ -1002,7 +1077,9 @@ end try"#,
                         .unwrap_or_default();
                 Ok(v)
             }
-            AuthStyle::AwsSigv4 { .. } | AuthStyle::None => Ok("".to_string()),
+            AuthStyle::AwsSigv4 { .. } | AuthStyle::GithubCopilot { .. } | AuthStyle::None => {
+                Ok("".to_string())
+            }
         }
     }
 
@@ -1072,6 +1149,220 @@ end try"#,
             }
             _ => anyhow::bail!("Provider is not configured for OAuth M2M"),
         }
+    }
+
+    async fn refresh_copilot_token(&self) -> Result<(String, u64)> {
+        match &self.auth {
+            AuthStyle::GithubCopilot {
+                token_url,
+                token_ref,
+                github_token,
+                enterprise_domain,
+            } => {
+                let gh_token = Self::resolve_github_token(
+                    token_ref.as_deref(),
+                    github_token.as_deref(),
+                    enterprise_domain.as_deref(),
+                )
+                .context(format!(
+                    "Missing GitHub OAuth token for Copilot provider '{}'. Please set github_token, github_token_ref, or authenticate with GitHub / GHE.",
+                    self.provider_id
+                ))?;
+
+                let uri: Uri = token_url.parse().context(format!(
+                    "Invalid token_url '{}' for provider '{}'",
+                    token_url, self.provider_id
+                ))?;
+
+                let auth_header = if gh_token.starts_with("ghu_")
+                    || gh_token.starts_with("gho_")
+                    || gh_token.starts_with("ghp_")
+                    || gh_token.starts_with("github_pat_")
+                {
+                    format!("token {}", gh_token)
+                } else if gh_token.starts_with("Bearer ") || gh_token.starts_with("token ") {
+                    gh_token.clone()
+                } else {
+                    format!("token {}", gh_token)
+                };
+
+                let req = Request::builder()
+                    .method(Method::GET)
+                    .uri(uri)
+                    .header("authorization", auth_header)
+                    .header("accept", "application/json")
+                    .header("editor-version", "vscode/1.96.0")
+                    .header("editor-plugin-version", "copilot-chat/0.22.0")
+                    .header("user-agent", "GithubCopilot/1.22.0")
+                    .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())?;
+
+                let resp = self.client.request(req).await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let err_bytes = BodyExt::collect(resp.into_body())
+                        .await
+                        .map(|b| b.to_bytes())
+                        .unwrap_or_default();
+                    let err_msg = String::from_utf8_lossy(&err_bytes);
+                    anyhow::bail!(
+                        "Copilot token exchange failed with status {}: {}",
+                        status,
+                        err_msg
+                    );
+                }
+
+                let bytes = BodyExt::collect(resp.into_body()).await?.to_bytes();
+                let json: serde_json::Value = serde_json::from_slice(&bytes)?;
+
+                let token = json["token"]
+                    .as_str()
+                    .context("Copilot token response missing 'token' field")?
+                    .to_string();
+
+                let expires_at = json["expires_at"].as_u64();
+                let expires_in = if let Some(exp) = expires_at {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if exp > now {
+                        exp - now
+                    } else {
+                        1800
+                    }
+                } else {
+                    json["expires_in"].as_u64().unwrap_or(1800)
+                };
+
+                info!(
+                    "Successfully refreshed GitHub Copilot session token for provider '{}' (expires in {}s)",
+                    self.provider_id, expires_in
+                );
+
+                Ok((token, expires_in))
+            }
+            _ => anyhow::bail!("Provider is not configured for GithubCopilot auth"),
+        }
+    }
+
+    fn resolve_github_token(
+        reference: Option<&str>,
+        inline: Option<&str>,
+        enterprise_domain: Option<&str>,
+    ) -> Option<String> {
+        // 1. Explicit reference or inline
+        if let Some(tok) = Self::resolve_secret(reference, inline, "github_token") {
+            return Some(tok);
+        }
+
+        // 2. Check environment variables
+        if let Ok(tok) = std::env::var("GITHUB_COPILOT_TOKEN") {
+            if !tok.trim().is_empty() {
+                return Some(tok);
+            }
+        }
+        if let Ok(tok) = std::env::var("GITHUB_TOKEN") {
+            if !tok.trim().is_empty() {
+                return Some(tok);
+            }
+        }
+        if let Ok(tok) = std::env::var("GH_TOKEN") {
+            if !tok.trim().is_empty() {
+                return Some(tok);
+            }
+        }
+
+        // 3. Check ~/.config/github-copilot/hosts.json
+        if let Some(home) = dirs::home_dir() {
+            let hosts_path = home.join(".config/github-copilot/hosts.json");
+            if let Ok(content) = std::fs::read_to_string(hosts_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(domain) = enterprise_domain {
+                        let clean_domain = domain
+                            .trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .trim_end_matches('/');
+                        if let Some(tok) = json[clean_domain]["oauth_token"].as_str() {
+                            return Some(tok.to_string());
+                        }
+                    }
+                    if let Some(tok) = json["github.com"]["oauth_token"].as_str() {
+                        return Some(tok.to_string());
+                    }
+                    if let Some(obj) = json.as_object() {
+                        for (_, val) in obj {
+                            if let Some(tok) = val["oauth_token"].as_str() {
+                                return Some(tok.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+
+            let apps_path = home.join(".config/github-copilot/apps.json");
+            if let Ok(content) = std::fs::read_to_string(apps_path) {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(domain) = enterprise_domain {
+                        let clean_domain = domain
+                            .trim_start_matches("https://")
+                            .trim_start_matches("http://")
+                            .trim_end_matches('/');
+                        if let Some(obj) = json.as_object() {
+                            for (k, val) in obj {
+                                if k.contains(clean_domain) {
+                                    if let Some(tok) = val["oauth_token"].as_str() {
+                                        return Some(tok.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(obj) = json.as_object() {
+                        for (_, val) in obj {
+                            if let Some(tok) = val["oauth_token"].as_str() {
+                                return Some(tok.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. macOS Keychain lookup
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(domain) = enterprise_domain {
+                let clean_domain = domain
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_end_matches('/');
+                let service_names = [
+                    format!("GitHub - https://{}", clean_domain),
+                    format!("GitHub Enterprise - https://{}", clean_domain),
+                    format!("GitHub - https://api.{}", clean_domain),
+                ];
+                for svc in &service_names {
+                    if let Ok(entry) = Entry::new(svc, "") {
+                        if let Ok(pass) = entry.get_password() {
+                            return Some(pass);
+                        }
+                    }
+                }
+            }
+            let default_services = [
+                "GitHub - https://api.github.com",
+                "vscode-github.login/gh-token",
+            ];
+            for svc in &default_services {
+                if let Ok(entry) = Entry::new(svc, "") {
+                    if let Ok(pass) = entry.get_password() {
+                        return Some(pass);
+                    }
+                }
+            }
+        }
+
+        None
     }
 
     fn resolve_secret(
