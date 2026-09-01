@@ -376,11 +376,13 @@ async fn fetch_openai_compatible_models(prov: &Provider) -> Result<Vec<OpenAiMod
         prov.id
     );
     let base = prov.base_url.trim_end_matches('/');
-    let uri_str = if base.ends_with("/v1")
+    // GitHub Copilot uses /models directly (not /v1/models)
+    let is_copilot = matches!(prov.auth, crate::provider::AuthStyle::GithubCopilot { .. });
+    let has_v1_prefix = base.ends_with("/v1")
         || base.ends_with("/openai")
         || base.contains("/v1/")
-        || base.contains("/openai/")
-    {
+        || base.contains("/openai/");
+    let uri_str = if is_copilot || has_v1_prefix {
         format!("{}://{}/models", prov.scheme, base)
     } else {
         format!("{}://{}/v1/models", prov.scheme, base)
