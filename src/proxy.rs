@@ -310,6 +310,16 @@ pub async fn handle_request(
         (path_and_query.clone(), final_bytes)
     };
 
+    // Rewrite path for GitHub Copilot: chat/embeddings/completions endpoints are without /v1
+    let target_path_and_query = if matches!(provider.auth, AuthStyle::GithubCopilot { .. }) {
+        target_path_and_query
+            .replacen("/v1/chat/completions", "/chat/completions", 1)
+            .replacen("/v1/embeddings", "/embeddings", 1)
+            .replacen("/v1/completions", "/completions", 1)
+    } else {
+        target_path_and_query
+    };
+
     // 6. Build upstream URI
     let upstream_uri_str = build_upstream_uri(&provider, &target_path_and_query)?;
     let upstream_uri: hyper::Uri = upstream_uri_str.parse()?;
