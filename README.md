@@ -261,20 +261,28 @@ models = []
 
 Secrets can be stored securely in the system keyring instead of plaintext configuration files.
 
-### 1. Store Secrets
-Save credentials using `keychain:<provider_id>:<secret_type>` identifiers:
+### Key Rules for macOS Keychain with `llm-proxy`
+* **Service Name**: The Keychain Service name (`-s`) must **always** be `"llm-proxy"`, regardless of the provider ID or provider type.
+* **Account Name**: The Keychain Account name (`-a`) corresponds directly to the string after `keychain:` in your configuration file.
+  * Convention: `keychain:<provider_id>:<secret_type>` (e.g. `keychain:github-copilot:token`, `keychain:cloudflare-ai:api_key`).
+* **Updating / Overwriting**: Always use `-U` with `security add-generic-password` to update existing entries cleanly without duplicating them.
+
+### 1. Store Secrets CLI Examples
 
 ```bash
-# Google Gemini API Key
-security add-generic-password -s "llm-proxy" -a "google_test:api_key" -w "YOUR_GEMINI_API_KEY"
+# Save an API key (e.g., Google Gemini or Cloudflare AI)
+security add-generic-password -U -s "llm-proxy" -a "cloudflare-ai:api_key" -w "YOUR_API_KEY"
 
-# Enterprise LLM API Credentials
-security add-generic-password -s "llm-proxy" -a "enterprise-api:client_secret" -w "YOUR_CLIENT_SECRET"
-security add-generic-password -s "llm-proxy" -a "enterprise-api:api_key" -w "YOUR_Enterprise_GATEWAY_KEY"
+# Save an Enterprise OAuth Client Secret
+security add-generic-password -U -s "llm-proxy" -a "enterprise-api:client_secret" -w "YOUR_CLIENT_SECRET"
+security add-generic-password -U -s "llm-proxy" -a "enterprise-api:api_key" -w "YOUR_GATEWAY_KEY"
+
+# Save a GitHub / GitHub Enterprise Token (extracted directly from gh CLI)
+security add-generic-password -U -s "llm-proxy" -a "github-copilot:token" -w "$(gh auth token --hostname ghe.example.com)"
 
 # AWS Static Credentials (if not using AWS SSO)
-security add-generic-password -s "llm-proxy" -a "aws-bedrock:aws_access_key_id" -w "AKIAIOSFODNN7EXAMPLE"
-security add-generic-password -s "llm-proxy" -a "aws-bedrock:aws_secret_access_key" -w "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+security add-generic-password -U -s "llm-proxy" -a "aws-bedrock:aws_access_key_id" -w "AKIAIOSFODNN7EXAMPLE"
+security add-generic-password -U -s "llm-proxy" -a "aws-bedrock:aws_secret_access_key" -w "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
 ```
 
 ### 2. Migrate Legacy Flat Keychain Keys
@@ -337,36 +345,55 @@ When a client sends a request with `"model": "<name>"`, `llm-proxy` resolves the
 
 ## GitHub Copilot Provider Integration
 
-`llm-proxy` supports routing requests through GitHub Copilot (both public `github.com` and **GitHub Enterprise Cloud** `XXX.ghe.com`).
+`llm-proxy` supports routing requests through GitHub Copilot (both public `github.com` and **GitHub Enterprise Cloud / Server** `ghe.example.com`).
 
-### How It Works
-1. `llm-proxy` takes the root GitHub OAuth token (`ghu_...` or PAT) from:
-   - Config reference (`github_token_ref = "keychain:copilot:token"` or `github_token`)
-   - Environment variables (`GITHUB_COPILOT_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`)
-   - Copilot CLI config files (`~/.config/github-copilot/hosts.json` / `apps.json`)
-   - macOS Keychain (`GitHub - https://XXX.ghe.com` or `vscode-github.login/gh-token`)
-2. `llm-proxy` dynamically exchanges the root token with the Copilot internal endpoint (`https://api.XXX.ghe.com/copilot_internal/v2/token` or `https://api.github.com/copilot_internal/v2/token`) to obtain a short-lived session token (`tid=...`).
-3. Session tokens are cached in memory and automatically refreshed before expiration (typically every 30 minutes).
-4. Outbound inference requests to Copilot API automatically have required Copilot editor and telemetry headers injected (`Editor-Version`, `Editor-Plugin-Version`, `Copilot-Integration-Id`, etc.).
+### Supported Authentication Modes
 
-### Configuration Example: GitHub Enterprise Cloud (`XXX.ghe.com`)
+#### 1. GitHub Enterprise Cloud / Server (`ghe.example.com`)
+GitHub Enterprise instances typically route Copilot API requests directly to their dedicated endpoint (`copilot-api.<domain>`) using persistent Enterprise OAuth tokens without requiring the dynamic token exchange endpoint.
+
+Configure this with `auth_style = "static_bearer"`:
 
 ```toml
 [[providers]]
-id = "copilot"
-base_url = "api.individual.githubcopilot.com" # or "api.XXX.ghe.com"
+id = "github-copilot"
+base_url = "copilot-api.ghe.example.com"
+scheme = "https"
+dialect = "openai_compatible"
+auth_style = "static_bearer"
+bearer_token_ref = "keychain:github-copilot:token"
+
+models = [
+  { id = "gpt-4o", alias = "copilot-4o" },
+  { id = "claude-3.5-sonnet", alias = "copilot-sonnet" },
+]
+```
+
+**Storing the Enterprise Token in Keychain:**
+Log in with GitHub CLI to your enterprise host, then store the token directly into the Keychain under the `llm-proxy` service:
+
+```bash
+# 1. Log in to your enterprise host (if not already logged in)
+gh auth login --hostname ghe.example.com --web
+
+# 2. Store the token in macOS Keychain
+security add-generic-password -U \
+  -s "llm-proxy" \
+  -a "github-copilot:token" \
+  -w "$(gh auth token --hostname ghe.example.com)"
+```
+
+#### 2. Public GitHub (`github.com`) Dynamic Token Exchange
+For standard `github.com` accounts, `llm-proxy` dynamically exchanges your GitHub personal access or OAuth token for a short-lived Copilot session token (`tid=...`) using the internal exchange endpoint, and automatically refreshes it before expiration.
+
+```toml
+[[providers]]
+id = "github-copilot"
+base_url = "api.individual.githubcopilot.com"
 scheme = "https"
 dialect = "openai_compatible"
 auth_style = "github_copilot"
-
-# Enterprise domain configuration (automatically derives token endpoint):
-enterprise_domain = "XXX.ghe.com"
-
-# Or specify custom token exchange endpoint explicitly:
-# github_token_url = "https://api.XXX.ghe.com/copilot_internal/v2/token"
-
-# Token reference in keychain or inline:
-github_token_ref = "keychain:copilot:github_token"
+github_token_ref = "keychain:github-copilot:github_token"
 
 models = [
   { id = "gpt-4o", alias = "copilot-4o" },
@@ -375,3 +402,14 @@ models = [
   { id = "o3-mini" },
 ]
 ```
+
+**Storing the GitHub.com Token in Keychain:**
+```bash
+security add-generic-password -U \
+  -s "llm-proxy" \
+  -a "github-copilot:github_token" \
+  -w "$(gh auth token --hostname github.com)"
+```
+
+### Automatic Header Injection
+For both modes, outbound requests through `llm-proxy` automatically include the required Copilot editor and routing headers (`Editor-Version`, `Editor-Plugin-Version`, `Copilot-Integration-Id`, `Openai-Organization`, etc.), allowing seamless use with standard OpenAI clients and tools.
